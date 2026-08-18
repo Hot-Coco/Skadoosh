@@ -1,0 +1,4 @@
+/target
+/models
+tests/data/*.wav
+selftest_out.wav

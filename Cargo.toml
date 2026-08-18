@@ -1,0 +1,49 @@
+[package]
+name = "skadoosh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Hot-Coco/Skadoosh"
+homepage = "https://github.com/Hot-Coco/Skadoosh"
+keywords = ["voice", "stt", "tts", "llm", "audio"]
+categories = ["multimedia::audio", "science"]
+exclude = ["models/", "tests/data/", ".github/", "scripts/"]
+
+[lib]
+name = "skadoosh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "skadoosh"
+path = "src/main.rs"
+
+[dependencies]
+ort = "=2.0.0-rc.13"
+whisper-rs = "=0.15.1"
+cpal = "=0.18"
+ringbuf = "=0.4"
+reqwest = { version = "=0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "=0.7"
+futures-util = "=0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "=2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "=4", features = ["derive", "env"] }
+
+[dev-dependencies]
+hound = "=3"
+tokio = { version = "1", features = ["full"] }
+
+# Keep whisper.cpp/ort-heavy dev builds usable.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
