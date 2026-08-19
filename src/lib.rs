@@ -23,5 +23,5 @@ pub mod vad;
 
 pub use config::Config;
 pub use error::{Result, SkadooshError};
-pub use pipeline::Pipeline;
+pub use pipeline::{Pipeline, SelftestReport};
 pub use tts::TtsEngine;
