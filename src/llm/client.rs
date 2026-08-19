@@ -30,28 +30,65 @@ pub struct Message {
 }
 
 /// Streaming LLM client for an OpenAI-compatible `/chat/completions` API.
+///
+/// Implements [`LlmBackend`](crate::llm::LlmBackend).
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
     model: String,
+    /// Optional bearer token for hosted providers (Ollama needs none).
+    /// Never logged.
+    api_key: Option<String>,
     max_history_turns: usize,
+    system_prompt: String,
     history: Vec<Message>,
 }
 
 impl LlmClient {
     /// Creates a client; history is seeded with `system_prompt`. The HTTP
     /// client deliberately has no request timeout (streams are long-lived).
-    pub fn new(base_url: &str, model: &str, system_prompt: &str, max_history_turns: usize) -> Self {
+    ///
+    /// `api_key` (from `--api-key` / `SKADOOSH_API_KEY`) unlocks hosted
+    /// OpenAI-compatible providers: when `Some`, every request carries an
+    /// `Authorization: Bearer <key>` header. Local Ollama needs no key —
+    /// pass `None`. The key is never logged.
+    pub fn new(
+        base_url: &str,
+        model: &str,
+        system_prompt: &str,
+        max_history_turns: usize,
+        api_key: Option<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
+            api_key,
             max_history_turns,
+            system_prompt: system_prompt.to_string(),
             history: vec![Message {
                 role: "system".to_string(),
                 content: system_prompt.to_string(),
             }],
         }
+    }
+
+    /// The model name this client requests (also its
+    /// [`LlmBackend::name`](crate::llm::LlmBackend::name)).
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    /// Builds the config-default client (the one shared construction used
+    /// by the binary's pipeline and the SDK facade).
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        Self::new(
+            &config.llm_url,
+            &config.llm_model,
+            &config.system_prompt,
+            config.max_history_turns,
+            config.api_key.clone(),
+        )
     }
 
     /// Streams a reply: appends the user message, POSTs
@@ -100,9 +137,13 @@ impl LlmClient {
         });
         let url = format!("{}/chat/completions", self.base_url);
 
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
         let resp = tokio::select! {
             _ = cancel.cancelled() => return Err(LlmError::Cancelled.into()),
-            r = self.http.post(&url).json(&body).send() => r.map_err(LlmError::Http)?,
+            r = request.send() => r.map_err(LlmError::Http)?,
         };
         let resp = ensure_success(resp).await?;
 
@@ -174,6 +215,16 @@ impl LlmClient {
     /// Current conversation history (system prompt first).
     pub fn history(&self) -> &[Message] {
         &self.history
+    }
+
+    /// Resets the conversation to just the system prompt (the
+    /// [`LlmBackend`](crate::llm::LlmBackend) history-discipline hook).
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.history.push(Message {
+            role: "system".to_string(),
+            content: self.system_prompt.clone(),
+        });
     }
 
     /// Keeps the system message plus the last `max_history_turns`

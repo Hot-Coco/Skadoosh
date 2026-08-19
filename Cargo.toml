@@ -1,10 +1,11 @@
 [package]
 name = "skadoosh"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/Hot-Coco/Skadoosh"
 homepage = "https://github.com/Hot-Coco/Skadoosh"
 keywords = ["voice", "stt", "tts", "llm", "audio"]
@@ -19,8 +20,16 @@ path = "src/lib.rs"
 name = "skadoosh"
 path = "src/main.rs"
 
+[features]
+default = ["download-binaries"]
+## Build-time download of a prebuilt ONNX Runtime (default). Disable default
+## features and enable `load-dynamic` to link a system ONNX Runtime at
+## runtime instead (what docs.rs uses, since its sandbox has no network).
+download-binaries = ["ort/download-binaries", "ort/tls-rustls", "ort/copy-dylibs"]
+load-dynamic = ["ort/load-dynamic"]
+
 [dependencies]
-ort = "=2.0.0-rc.13"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-27"] }
 whisper-rs = "=0.15.1"
 cpal = "=0.18"
 ringbuf = "=0.4"
@@ -47,3 +56,11 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# docs.rs builds in a network-less sandbox, so the ORT binary download would
+# fail there; build docs against `load-dynamic` instead (no download, no
+# link-time dependency).
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["load-dynamic"]
+rustdoc-args = ["--cfg", "docsrs"]

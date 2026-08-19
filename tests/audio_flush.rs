@@ -28,6 +28,7 @@ fn flush_epoch_discards_pending_samples_on_next_period() {
         PERIOD,
         Arc::clone(&flush_epoch),
         Arc::clone(&is_playing),
+        Arc::new(AtomicU64::new(0)),
     );
     let mut period = [1.0f32; PERIOD];
 
@@ -80,6 +81,7 @@ fn is_playing_clears_when_ring_runs_dry() {
         PERIOD,
         flush_epoch,
         Arc::clone(&is_playing),
+        Arc::new(AtomicU64::new(0)),
     );
     let mut period = [0.0f32; PERIOD];
 

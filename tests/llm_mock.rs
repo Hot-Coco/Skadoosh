@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 const SYSTEM: &str = "You are a test bot.";
 
 fn client(url: &str, max_history_turns: usize) -> LlmClient {
-    LlmClient::new(url, "mock-model", SYSTEM, max_history_turns)
+    LlmClient::new(url, "mock-model", SYSTEM, max_history_turns, None)
 }
 
 /// Drains the clause channel after `stream_reply` has returned (its `Sender`
@@ -309,6 +309,79 @@ async fn cancel_before_request_returns_cancelled() {
         .expect("pre-cancelled stream_reply must return promptly");
     assert!(matches!(res, Err(SkadooshError::Llm(LlmError::Cancelled))));
     assert_eq!(client.history().len(), 2, "no assistant reply on cancel");
+}
+
+#[tokio::test]
+async fn api_key_sets_bearer_auth_header() {
+    // With a key, every request carries `Authorization: Bearer <key>`
+    // (unlocks hosted OpenAI-compatible providers).
+    let server =
+        MockOpenAi::serve(vec![Chunk::now(token_line("Hi.")), Chunk::now(done_line())]).await;
+    let mut client = LlmClient::new(
+        &server.url(),
+        "mock-model",
+        SYSTEM,
+        8,
+        Some("sk-test-secret".to_string()),
+    );
+    let (tx, mut rx) = mpsc::channel(16);
+    client
+        .stream_reply("hello", tx, CancellationToken::new())
+        .await
+        .expect("stream_reply should succeed");
+    let got = drain(&mut rx).await;
+    assert_eq!(got.concat(), "Hi.");
+
+    let req = server.captured_request().expect("request captured");
+    assert!(
+        req.to_lowercase()
+            .contains("authorization: bearer sk-test-secret"),
+        "request must carry the bearer token: {req}"
+    );
+}
+
+#[tokio::test]
+async fn no_api_key_sends_no_authorization_header() {
+    // Ollama-style local servers need no key: the header must be absent.
+    let server =
+        MockOpenAi::serve(vec![Chunk::now(token_line("Hi.")), Chunk::now(done_line())]).await;
+    let mut client = client(&server.url(), 8);
+    let (tx, _rx) = mpsc::channel(16);
+    client
+        .stream_reply("hello", tx, CancellationToken::new())
+        .await
+        .expect("stream_reply should succeed");
+
+    let req = server.captured_request().expect("request captured");
+    assert!(
+        !req.to_lowercase().contains("authorization:"),
+        "no key → no Authorization header: {req}"
+    );
+}
+
+#[tokio::test]
+async fn clear_history_resets_to_system_prompt() {
+    let server =
+        MockOpenAi::serve(vec![Chunk::now(token_line("Hi.")), Chunk::now(done_line())]).await;
+    let mut client = client(&server.url(), 8);
+    let (tx, _rx) = mpsc::channel(16);
+    client
+        .stream_reply("hello", tx, CancellationToken::new())
+        .await
+        .expect("stream_reply should succeed");
+    assert_eq!(client.history().len(), 3);
+
+    use skadoosh::llm::LlmBackend;
+    client.clear_history();
+    let h = client.history();
+    assert_eq!(h.len(), 1, "history resets to the system prompt: {h:?}");
+    assert_eq!(h[0].role, "system");
+    assert_eq!(h[0].content, SYSTEM);
+    // The LlmBackend trait method does the same thing.
+    LlmBackend::clear_history(&mut client);
+    assert_eq!(client.history().len(), 1);
+    // LlmBackend::name is the model name.
+    assert_eq!(LlmBackend::name(&client), "mock-model");
 }
 
 #[test]

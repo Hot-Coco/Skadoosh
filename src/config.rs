@@ -1,8 +1,9 @@
 //! CLI configuration: clap derive with `SKADOOSH_*` env fallbacks.
 
+use std::fmt;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::error::Result;
 
@@ -10,11 +11,26 @@ use crate::error::Result;
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a voice assistant. Reply in short, \
      spoken-style sentences. Keep answers under three sentences unless asked for detail.";
 
+/// Output modality of the agent (`--output` / `SKADOOSH_OUTPUT`).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// Speak replies through the output device (TTS + playback).
+    #[default]
+    Audio,
+    /// Print transcripts and streamed reply clauses on stdout instead of
+    /// playing audio (voice-in → text-out). Needs no TTS model and no
+    /// output device.
+    Text,
+}
+
 /// Command-line configuration for `skadoosh`.
 ///
 /// Every flag falls back to a `SKADOOSH_*` environment variable; flags win
 /// over env vars, env vars win over defaults.
-#[derive(Parser, Debug, Clone)]
+///
+/// `Debug` is hand-rolled (below) so `api_key` can never leak into logs —
+/// "never logged" is a documented promise on the flag.
+#[derive(Parser, Clone)]
 #[command(
     name = "skadoosh",
     version,
@@ -35,6 +51,11 @@ pub struct Config {
     /// Model name passed to the chat-completions API.
     #[arg(long, env = "SKADOOSH_LLM_MODEL", default_value = "qwen2.5:0.5b")]
     pub llm_model: String,
+
+    /// API key for hosted OpenAI-compatible providers; sent as
+    /// `Authorization: Bearer <key>`. Local Ollama needs none. Never logged.
+    #[arg(long, env = "SKADOOSH_API_KEY", hide_env_values = true)]
+    pub api_key: Option<String>,
 
     /// System prompt seeded into the LLM conversation history.
     #[arg(long, env = "SKADOOSH_SYSTEM_PROMPT", default_value = DEFAULT_SYSTEM_PROMPT)]
@@ -98,6 +119,111 @@ pub struct Config {
     /// write `selftest_out.wav`, print the latency table, and exit.
     #[arg(long, env = "SKADOOSH_SELFTEST", value_name = "WAV_PATH")]
     pub selftest: Option<PathBuf>,
+
+    /// Interactive text-in/text-out loop on stdin/stdout: no audio, no
+    /// VAD/STT/TTS — the same LLM history/prompt machinery, printing reply
+    /// clauses as they stream. Exit with `/quit` or EOF (ctrl-d).
+    #[arg(long, env = "SKADOOSH_REPL")]
+    pub repl: bool,
+
+    /// One-shot text→speech: synthesize `TEXT` with the TTS engine and play
+    /// it (or write it to `--out-wav` instead — no audio device needed).
+    #[arg(long, env = "SKADOOSH_SAY", value_name = "TEXT")]
+    pub say: Option<String>,
+
+    /// Output modality of the voice loop: play replies on the output device
+    /// (`audio`) or print transcripts and streamed replies on stdout
+    /// (`text`).
+    #[arg(long, env = "SKADOOSH_OUTPUT", value_enum, default_value_t = OutputMode::Audio)]
+    pub output: OutputMode,
+
+    /// With `--say`: write the synthesized speech to this 24 kHz wav file
+    /// instead of playing it (headless-friendly).
+    #[arg(long, env = "SKADOOSH_OUT_WAV", value_name = "PATH")]
+    pub out_wav: Option<PathBuf>,
+}
+
+impl Default for Config {
+    /// Defaults matching the clap flag defaults (SDK entry point —
+    /// `Config::default()` equals bare `skadoosh` with no flags).
+    fn default() -> Self {
+        Self {
+            llm_url: "http://localhost:11434/v1".to_string(),
+            llm_model: "qwen2.5:0.5b".to_string(),
+            api_key: None,
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            max_history_turns: 8,
+            whisper_model: PathBuf::from("models/ggml-tiny.en.bin"),
+            vad_model: PathBuf::from("models/silero_vad.onnx"),
+            tts_model: None,
+            tts_voices: None,
+            vad_threshold: 0.5,
+            silence_ms: 300,
+            input_device: None,
+            output_device: None,
+            list_devices: false,
+            mock_tts: false,
+            selftest: None,
+            repl: false,
+            say: None,
+            output: OutputMode::Audio,
+            out_wav: None,
+        }
+    }
+}
+
+impl fmt::Debug for Config {
+    /// Every field prints normally EXCEPT `api_key`, which is redacted —
+    /// the flag documents "never logged", and a derived `Debug` would be
+    /// one `info!(?config)` away from breaking that. The exhaustive
+    /// destructuring means a future field fails to compile until it is
+    /// considered here (and redacted too if ever secret).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            llm_url,
+            llm_model,
+            api_key,
+            system_prompt,
+            max_history_turns,
+            whisper_model,
+            vad_model,
+            tts_model,
+            tts_voices,
+            vad_threshold,
+            silence_ms,
+            input_device,
+            output_device,
+            list_devices,
+            mock_tts,
+            selftest,
+            repl,
+            say,
+            output,
+            out_wav,
+        } = self;
+        f.debug_struct("Config")
+            .field("llm_url", llm_url)
+            .field("llm_model", llm_model)
+            .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
+            .field("system_prompt", system_prompt)
+            .field("max_history_turns", max_history_turns)
+            .field("whisper_model", whisper_model)
+            .field("vad_model", vad_model)
+            .field("tts_model", tts_model)
+            .field("tts_voices", tts_voices)
+            .field("vad_threshold", vad_threshold)
+            .field("silence_ms", silence_ms)
+            .field("input_device", input_device)
+            .field("output_device", output_device)
+            .field("list_devices", list_devices)
+            .field("mock_tts", mock_tts)
+            .field("selftest", selftest)
+            .field("repl", repl)
+            .field("say", say)
+            .field("output", output)
+            .field("out_wav", out_wav)
+            .finish()
+    }
 }
 
 impl Config {
@@ -110,10 +236,19 @@ impl Config {
     /// Validates the configuration:
     ///
     /// * `--vad-threshold` must lie in `[0, 1)`.
-    /// * Whisper/VAD model files must exist (except for `--list-devices`).
+    /// * `--repl` conflicts with `--say` and `--selftest`; `--say` conflicts
+    ///   with `--selftest` and `--output text`; `--out-wav` requires
+    ///   `--say`.
+    /// * Whisper/VAD model files must exist when the run uses them — i.e.
+    ///   for the voice loop and `--selftest`, but not for `--repl`/`--say`
+    ///   (except for `--list-devices`, which skips all checks).
     /// * The `--selftest` wav must exist when given.
-    /// * Missing Kokoro model/voices files only produce a warning — the
-    ///   pipeline falls back to MockTts (see [`crate::tts::build_engine`]).
+    /// * TTS (Kokoro or the MockTts fallback) is needed by `--say` and by
+    ///   the voice loop in `--output audio` mode; `--repl` and
+    ///   `--output text` skip TTS entirely. Missing Kokoro files only
+    ///   produce a warning — the pipeline falls back to MockTts (see
+    ///   [`crate::tts::build_engine`]). `--say` without `--out-wav` plays to
+    ///   an output device, which is checked when playback starts.
     pub fn validate(&self) -> Result<()> {
         if self.list_devices {
             return Ok(());
@@ -127,16 +262,72 @@ impl Config {
             .into());
         }
 
-        for (flag, path) in [
-            ("--whisper-model", &self.whisper_model),
-            ("--vad-model", &self.vad_model),
-        ] {
-            if !path.exists() {
-                return Err(anyhow::anyhow!(
-                    "{flag} not found: {} (run scripts/download_models.sh)",
-                    path.display()
-                )
-                .into());
+        // Mode conflicts: the three run modes are mutually exclusive (the
+        // first two, in flag order, are named in the error).
+        let modes = [
+            ("--repl", self.repl),
+            ("--say", self.say.is_some()),
+            ("--selftest", self.selftest.is_some()),
+        ];
+        let active: Vec<&str> = modes
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| *name)
+            .collect();
+        if let [first, second, ..] = active.as_slice() {
+            return Err(anyhow::anyhow!("{first} and {second} cannot be combined").into());
+        }
+        if self.say.is_some() && self.output == OutputMode::Text {
+            return Err(anyhow::anyhow!(
+                "--output text conflicts with --say (a spoken reply needs audio output)"
+            )
+            .into());
+        }
+        if self.out_wav.is_some() && self.say.is_none() {
+            return Err(anyhow::anyhow!("--out-wav is only meaningful together with --say").into());
+        }
+
+        // Silently-inert combos are accepted but warned about, so a stray
+        // flag isn't mistaken for having an effect. (Clap can't tell an
+        // explicit `--output audio` from the default, so `--repl` always
+        // warns; the say-side VAD/input warnings fire on non-default
+        // values only.)
+        if self.repl && self.output == OutputMode::Audio {
+            tracing::warn!("--output audio has no effect with --repl (the repl is text-only)");
+        }
+        if self.selftest.is_some() && self.output == OutputMode::Text {
+            tracing::warn!(
+                "--output text has no effect with --selftest (the selftest always synthesizes a wav)"
+            );
+        }
+        if self.say.is_some() {
+            let defaults = Config::default();
+            if self.input_device.is_some() {
+                tracing::warn!("--input-device has no effect with --say (no audio is captured)");
+            }
+            if self.vad_threshold != defaults.vad_threshold {
+                tracing::warn!("--vad-threshold has no effect with --say (no VAD runs)");
+            }
+            if self.silence_ms != defaults.silence_ms {
+                tracing::warn!("--silence-ms has no effect with --say (no VAD runs)");
+            }
+        }
+
+        // Whisper/VAD models are only needed when audio goes in (the voice
+        // loop and --selftest); --repl and --say never load them.
+        let needs_stt_vad = !self.repl && self.say.is_none();
+        if needs_stt_vad {
+            for (flag, path) in [
+                ("--whisper-model", &self.whisper_model),
+                ("--vad-model", &self.vad_model),
+            ] {
+                if !path.exists() {
+                    return Err(anyhow::anyhow!(
+                        "{flag} not found: {} (run scripts/download_models.sh)",
+                        path.display()
+                    )
+                    .into());
+                }
             }
         }
 
@@ -146,7 +337,10 @@ impl Config {
             }
         }
 
-        if !self.mock_tts {
+        // TTS is needed by --say and by the voice loop in audio mode; the
+        // repl and --output text never build an engine.
+        let needs_tts = self.say.is_some() || (!self.repl && self.output == OutputMode::Audio);
+        if needs_tts && !self.mock_tts {
             match (&self.tts_model, &self.tts_voices) {
                 (Some(model), Some(voices)) if model.exists() && voices.exists() => {}
                 (None, None) => {

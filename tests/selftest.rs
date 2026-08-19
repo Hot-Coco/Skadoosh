@@ -15,20 +15,21 @@
 #[path = "common/mock_openai.rs"]
 mod mock_openai;
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_openai::{done_line, token_line, Chunk, MockOpenAi};
-use skadoosh::config::Config;
+use skadoosh::agent::AgentEvent;
+use skadoosh::config::{Config, OutputMode};
 use skadoosh::error::SkadooshError;
 use skadoosh::llm::LlmClient;
-use skadoosh::pipeline::{run_orchestrator, ClipSink, SpeechToText, Topology, VadEventMsg};
+use skadoosh::pipeline::{run_orchestrator, ClipSink, Topology, VadEventMsg};
+use skadoosh::stt::MockStt;
 use skadoosh::tts::{MockTts, TtsClip};
 use skadoosh::{Pipeline, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 const VAD_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
@@ -52,6 +53,7 @@ fn base_config(llm_url: String) -> Config {
     Config {
         llm_url,
         llm_model: "mock-model".to_string(),
+        api_key: None,
         system_prompt: "You are a test bot.".to_string(),
         max_history_turns: 8,
         whisper_model: PathBuf::from(WHISPER_MODEL),
@@ -65,26 +67,10 @@ fn base_config(llm_url: String) -> Config {
         list_devices: false,
         mock_tts: true,
         selftest: None,
-    }
-}
-
-/// Scripted STT double: pops `(delay, transcript)` replies in order.
-struct ScriptedStt {
-    replies: Mutex<VecDeque<(Duration, String)>>,
-}
-
-impl SpeechToText for ScriptedStt {
-    async fn transcribe(&self, _samples: Vec<f32>) -> Result<String> {
-        let (delay, text) = self
-            .replies
-            .lock()
-            .expect("replies lock")
-            .pop_front()
-            .unwrap_or_default();
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        Ok(text)
+        repl: false,
+        say: None,
+        output: OutputMode::Audio,
+        out_wav: None,
     }
 }
 
@@ -93,6 +79,9 @@ impl SpeechToText for ScriptedStt {
 /// `queue_clip` until opened, so a test can hold the TTS task mid-turn
 /// while the clause backlog piles up behind it (a cancelled turn's
 /// `select!` simply drops the parked future).
+///
+/// The STT double is the crate's [`MockStt`]: a scripted queue of
+/// `(delay, transcript)` replies.
 #[derive(Clone)]
 struct RecordingSink {
     clips: mpsc::UnboundedSender<TtsClip>,
@@ -174,25 +163,23 @@ fn spawn_orchestrator_full(
         playing: Arc::clone(&playing),
         gate: gate.clone(),
     };
-    let stt = ScriptedStt {
-        replies: Mutex::new(
-            stt_replies
-                .into_iter()
-                .map(|(delay, text)| (delay, text.to_string()))
-                .collect(),
-        ),
-    };
-    let llm = LlmClient::new(llm_url, "mock-model", "You are a test bot.", 8);
+    let stt = MockStt::new();
+    for (delay, text) in stt_replies {
+        stt.push_delayed(delay, text);
+    }
+    let llm = LlmClient::new(llm_url, "mock-model", "You are a test bot.", 8, None);
     let shutdown = CancellationToken::new();
+    let (events, _) = broadcast::channel(64);
     let join = tokio::spawn(run_orchestrator(Topology {
         vad_events: vad_rx,
         fatal_tx: fatal_tx.clone(),
         fatal_rx,
-        stt,
-        llm,
-        tts_engine: Box::new(MockTts::new()),
+        stt: Box::new(stt),
+        llm: Box::new(llm),
+        tts_engine: Some(Box::new(MockTts::new())),
         sink,
         shutdown: shutdown.clone(),
+        events,
     }));
     Harness {
         vad_tx,
@@ -326,6 +313,46 @@ async fn selftest_end_to_end_with_mock_llm() {
     assert!(
         peak > 3_000,
         "output wav is implausibly quiet (peak {peak})"
+    );
+
+    let _ = std::fs::remove_file(&out_wav);
+}
+
+/// `--selftest` with `--api-key` sends the bearer header (regression: the
+/// selftest drives its own reqwest POST — not `LlmClient` — and used to
+/// skip the key, so keyed providers answered 401).
+#[tokio::test]
+async fn selftest_sends_bearer_auth_with_api_key() {
+    if !fixtures_present() {
+        return;
+    }
+    let server = MockOpenAi::serve(vec![
+        Chunk::now(token_line("Keyed reply.")),
+        Chunk::now(done_line()),
+    ])
+    .await;
+    let mut config = base_config(server.url());
+    config.api_key = Some("sk-selftest-secret".to_string());
+    config.silence_ms = 1_500;
+    let out_wav = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/selftest_auth_out.wav");
+    let out = out_wav.clone();
+
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || {
+            Pipeline::new(config).and_then(|p| p.run_selftest(Path::new(JFK_WAV), &out))
+        }),
+    )
+    .await
+    .expect("selftest exceeded 60 s")
+    .expect("selftest thread panicked")
+    .expect("run_selftest failed");
+
+    let req = server.captured_request().expect("request captured");
+    assert!(
+        req.to_lowercase()
+            .contains("authorization: bearer sk-selftest-secret"),
+        "selftest request must carry the bearer token: {req}"
     );
 
     let _ = std::fs::remove_file(&out_wav);
@@ -685,6 +712,198 @@ async fn fatal_error_from_task_shuts_pipeline_down() {
         Err(err) => assert!(err.to_string().contains("injected boom"), "got {err:?}"),
         Ok(()) => panic!("injected fatal must surface as Err"),
     }
+}
+
+/// v0.2: `--output text` voice turn — wav in (real Silero VAD + segmenter),
+/// MockStt transcript, mock-LLM reply, and NO TTS/playback: the reply
+/// surfaces as `Clause`/`ReplyDone` events (what the binary prints) and the
+/// sink never sees a clip. Mirrors the orchestrator half of
+/// `Pipeline::run`'s text mode (`NullSink` + `tts_engine: None`).
+#[tokio::test]
+async fn output_text_voice_turn_streams_reply_events() {
+    if !fixtures_present() {
+        return;
+    }
+
+    let (events_tx, mut events_rx) = broadcast::channel::<AgentEvent>(64);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+    // The orchestrator runs on its own runtime thread; this test thread
+    // collects events concurrently.
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let server = MockOpenAi::serve(vec![
+                Chunk::now(token_line("Alpha. ")),
+                Chunk::now(token_line("Beta.")),
+                Chunk::now(done_line()),
+            ])
+            .await;
+
+            let (vad_tx, vad_rx) = mpsc::channel(8);
+            let (fatal_tx, fatal_rx) = mpsc::channel(8);
+            let (clips_tx, _clips_rx) = mpsc::unbounded_channel();
+            let sink = RecordingSink {
+                clips: clips_tx,
+                flushes: Arc::new(AtomicU64::new(0)),
+                playing: Arc::new(AtomicBool::new(false)),
+                gate: None,
+            };
+            let stt = MockStt::from_replies(["ask not what your country can do for you"]);
+            let llm = LlmClient::new(&server.url(), "mock-model", "You are a test bot.", 8, None);
+            let shutdown = CancellationToken::new();
+            let join = tokio::spawn(run_orchestrator(Topology {
+                vad_events: vad_rx,
+                fatal_tx,
+                fatal_rx,
+                stt: Box::new(stt),
+                llm: Box::new(llm),
+                tts_engine: None, // text mode: no synthesis
+                sink,
+                shutdown: shutdown.clone(),
+                events: events_tx,
+            }));
+
+            // Feed jfk.wav through the real VAD, like the VAD task would.
+            let (mono, rate) = read_wav_samples(Path::new(JFK_WAV));
+            let samples = skadoosh::audio::resample_offline(&mono, rate, 16_000);
+            let mut vad = skadoosh::vad::SileroVad::new(Path::new(VAD_MODEL)).expect("vad loads");
+            let mut segmenter = skadoosh::vad::VadSegmenter::new(0.5, 1_500); // one segment for the whole sentence
+                                                                              // The file has no trailing silence to close the segment against
+                                                                              // the widened window — append some, like a live stream would.
+            let mut feed = samples;
+            feed.extend(std::iter::repeat_n(
+                0.0,
+                (1_500 / 32 + 2) * skadoosh::vad::FRAME_LEN,
+            ));
+            let mut sent = false;
+            for chunk in feed.chunks_exact(skadoosh::vad::FRAME_LEN) {
+                let frame: &[f32; skadoosh::vad::FRAME_LEN] =
+                    chunk.try_into().expect("chunks_exact");
+                let prob = vad.process(frame).expect("vad inference");
+                if let Some(skadoosh::vad::VadEvent::Segment(audio)) = segmenter.push(frame, prob) {
+                    vad_tx
+                        .send(VadEventMsg::Segment {
+                            samples: audio,
+                            t_speech_end: Instant::now(),
+                        })
+                        .await
+                        .expect("vad channel open");
+                    sent = true;
+                    break;
+                }
+            }
+            assert!(sent, "jfk.wav must produce a segment");
+
+            // The turn completes (ReplyDone observed by the collector); give
+            // it a bounded moment, then shut down.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            shutdown.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(5), join)
+                .await
+                .expect("orchestrator hung")
+                .expect("orchestrator panicked");
+            let _ = result_tx.send(result);
+        });
+    });
+
+    // Collect the full event sequence until the turn-end Listening (or a
+    // generous deadline): ORDER matters, not just presence — a turn-end
+    // Listening must never land between the turn's Transcript and its
+    // ReplyDone (it used to be emitted by the orchestrator at LLM
+    // stream-done, racing the TTS task's clause drain).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut order: Vec<&'static str> = Vec::new();
+    let mut transcripts = Vec::new();
+    let mut clauses = Vec::new();
+    let mut latency = None;
+    while Instant::now() < deadline {
+        if order.len() > 1 && order.last() == Some(&"Listening") {
+            break; // the turn-end Listening (after ReplyDone)
+        }
+        match tokio::time::timeout(Duration::from_secs(5), events_rx.recv()).await {
+            Ok(Ok(event)) => {
+                let kind = match &event {
+                    AgentEvent::Listening => "Listening",
+                    AgentEvent::SpeechStart => "SpeechStart",
+                    AgentEvent::Transcript(t) => {
+                        transcripts.push(t.clone());
+                        "Transcript"
+                    }
+                    AgentEvent::Clause(c) => {
+                        clauses.push(c.clone());
+                        "Clause"
+                    }
+                    AgentEvent::ReplyDone => "ReplyDone",
+                    AgentEvent::TurnCancelled => "TurnCancelled",
+                    AgentEvent::StageLatency {
+                        tts_ms,
+                        playback_ms,
+                        ..
+                    } => {
+                        latency = Some((*tts_ms, *playback_ms));
+                        "StageLatency"
+                    }
+                    AgentEvent::Error(_) => "Error",
+                };
+                order.push(kind);
+            }
+            Ok(Err(_)) => {} // lagged: keep going
+            Err(_) => break, // timeout
+        }
+    }
+
+    assert_eq!(
+        order,
+        vec![
+            "Listening",
+            "Transcript",
+            "Clause",
+            "Clause",
+            "StageLatency",
+            "ReplyDone",
+            "Listening"
+        ],
+        "text-mode turn event order"
+    );
+    assert!(
+        transcripts
+            .iter()
+            .any(|t| t.contains("ask not what your country")),
+        "transcript event: {transcripts:?}"
+    );
+    assert_eq!(clauses, vec!["Alpha.".to_string(), " Beta.".to_string()]);
+    assert_eq!(
+        latency,
+        Some((0, 0)),
+        "text mode has no tts/playback stage: {latency:?}"
+    );
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("orchestrator result");
+    result.expect("clean shutdown");
+}
+
+/// Minimal wav decode for the test above (16-bit PCM mono, like jfk.wav).
+fn read_wav_samples(path: &Path) -> (Vec<f32>, u32) {
+    let mut reader = hound::WavReader::open(path).expect("open wav");
+    let spec = reader.spec();
+    let rate = spec.sample_rate;
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => reader
+            .samples::<i16>()
+            .map(|s| f32::from(s.expect("sample")) / 32768.0)
+            .collect(),
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|s| s.expect("sample"))
+            .collect(),
+    };
+    (samples, rate)
 }
 
 /// Task 14 acceptance, headless `Pipeline::run`: on a device-less box the

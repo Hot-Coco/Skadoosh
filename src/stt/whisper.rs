@@ -17,6 +17,7 @@ use whisper_rs::{
 };
 
 use crate::error::{Result, SttError};
+use crate::stt::SttEngine;
 
 /// A transcription job: 16 kHz f32 samples plus the reply oneshot.
 type Job = (Vec<f32>, oneshot::Sender<Result<String>>);
@@ -203,6 +204,24 @@ impl WhisperStt {
         if self.worker.join().is_err() {
             warn!("skadoosh-stt worker panicked during shutdown");
         }
+    }
+}
+
+impl SttEngine for WhisperStt {
+    fn name(&self) -> &str {
+        "whisper"
+    }
+
+    fn transcribe(&self, samples: Vec<f32>) -> oneshot::Receiver<Result<String>> {
+        WhisperStt::transcribe(self, samples)
+    }
+
+    fn dropped_jobs(&self) -> u64 {
+        WhisperStt::dropped_jobs(self)
+    }
+
+    fn stop(self: Box<Self>) {
+        WhisperStt::stop(*self);
     }
 }
 

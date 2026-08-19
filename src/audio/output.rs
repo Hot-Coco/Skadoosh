@@ -14,6 +14,16 @@
 //! the RT callback compares epochs each period and calls `Consumer::clear()`
 //! itself — flush latency is bounded by one callback period (~5–10 ms) with
 //! zero locks on the RT thread.
+//!
+//! Graceful drain (one-shot speech, e.g. `Agent::say`):
+//! [`PlaybackHandle::wait_buffered`] / [`PlaybackHandle::wait_drained`]
+//! block until queued clips have all been pushed into the ring / fully
+//! consumed by the output callback, using four monotonic counters: the
+//! handle counts queued clips, the playback thread counts clips and samples
+//! pushed into the ring, and the pump counts samples consumed out of it.
+//! A flush-epoch bump or stop aborts the waits promptly (the queued audio
+//! is being discarded anyway). [`Playback::stop`] stays abrupt for pipeline
+//! shutdown.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -125,6 +135,11 @@ impl Playback {
         let flush_epoch = Arc::new(AtomicU64::new(0));
         let is_playing = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        // Drain counters (see the module docs): handle → thread → pump.
+        let clips_queued = Arc::new(AtomicU64::new(0));
+        let clips_pushed = Arc::new(AtomicU64::new(0));
+        let samples_pushed = Arc::new(AtomicU64::new(0));
+        let samples_consumed = Arc::new(AtomicU64::new(0));
 
         let pump = OutputPump::new(
             cons,
@@ -132,6 +147,7 @@ impl Playback {
             max_period_frames,
             Arc::clone(&flush_epoch),
             Arc::clone(&is_playing),
+            Arc::clone(&samples_consumed),
         );
         let stream = match sample_format {
             SampleFormat::F32 => {
@@ -164,24 +180,48 @@ impl Playback {
             .spawn({
                 let flush_epoch = Arc::clone(&flush_epoch);
                 let stop = Arc::clone(&stop);
-                move || playback_loop(stream, clips_rx, prod, flush_epoch, stop)
+                let clips_pushed = Arc::clone(&clips_pushed);
+                let samples_pushed = Arc::clone(&samples_pushed);
+                move || {
+                    // The stream plays until `_stream` is dropped at exit.
+                    let _stream = stream;
+                    clip_pump_loop(
+                        clips_rx,
+                        prod,
+                        &flush_epoch,
+                        &stop,
+                        &clips_pushed,
+                        &samples_pushed,
+                    );
+                }
             })
             .map_err(|err| {
                 AudioError::StreamBuild(format!("failed to spawn playback thread: {err}"))
             })?;
 
         Ok((
-            Playback { worker, stop },
+            Playback {
+                worker,
+                stop: Arc::clone(&stop),
+            },
             PlaybackHandle {
                 clips_tx,
                 flush_epoch,
                 is_playing,
                 sample_rate: CLIP_SAMPLE_RATE,
+                stop,
+                clips_queued,
+                clips_pushed,
+                samples_pushed,
+                samples_consumed,
             },
         ))
     }
 
-    /// Signals the playback thread to exit and joins it.
+    /// Signals the playback thread to exit and joins it. Abrupt by design
+    /// (pipeline shutdown): queued/ringed audio is discarded. The graceful
+    /// alternative is draining first via
+    /// [`PlaybackHandle::wait_drained`].
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.worker.join();
@@ -189,14 +229,26 @@ impl Playback {
 }
 
 /// Cloneable, `Send` handle to the running playback thread. Internally just
-/// clones of the clips mpsc `Sender` plus the epoch/`is_playing` atomics — it
-/// never touches the ring directly.
+/// clones of the clips mpsc `Sender` plus the epoch/`is_playing`/drain
+/// atomics — it never touches the ring directly.
 #[derive(Clone)]
 pub struct PlaybackHandle {
     clips_tx: mpsc::Sender<TtsClip>,
     flush_epoch: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
     sample_rate: u32,
+    /// Set when the owning [`Playback`] stops (aborts the drain waits).
+    stop: Arc<AtomicBool>,
+    /// Clips accepted by the clips channel (this handle's side of the
+    /// drain bookkeeping).
+    clips_queued: Arc<AtomicU64>,
+    /// Clips fully pushed into the playback ring (playback thread).
+    clips_pushed: Arc<AtomicU64>,
+    /// Samples pushed into the ring (playback thread, after any rate
+    /// normalization).
+    samples_pushed: Arc<AtomicU64>,
+    /// Samples consumed out of the ring by the output callback.
+    samples_consumed: Arc<AtomicU64>,
 }
 
 impl PlaybackHandle {
@@ -205,7 +257,9 @@ impl PlaybackHandle {
         self.clips_tx
             .send(clip)
             .await
-            .map_err(|_| AudioError::StreamBuild("playback thread exited".to_string()).into())
+            .map_err(|_| AudioError::StreamBuild("playback thread exited".to_string()))?;
+        self.clips_queued.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Lock-free flush: bumps the flush epoch. The RT callback clears the
@@ -223,6 +277,76 @@ impl PlaybackHandle {
     /// Sample rate of queued clips (24 000 Hz).
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Graceful-drain wait, queue half: returns once every clip queued so
+    /// far (by any clone of this handle) has been fully pushed into the
+    /// playback ring — the clips channel and any mid-push remainder are
+    /// empty, so at most the ring's capacity (~2 s) of audio remains
+    /// unplayed. The channel stays open and the thread keeps running.
+    ///
+    /// Returns `false` early when the wait is aborted: a [`flush`](Self::flush)
+    /// epoch bump (the queued audio is being discarded) or the playback
+    /// thread stopping.
+    pub async fn wait_buffered(&self) -> bool {
+        let epoch = self.flush_epoch.load(Ordering::Acquire);
+        let target = self.clips_queued.load(Ordering::SeqCst);
+        loop {
+            if self.drain_aborted(epoch) {
+                return false;
+            }
+            if self.clips_pushed.load(Ordering::SeqCst) >= target {
+                return true;
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    /// Graceful-drain wait, full: returns once every clip queued so far
+    /// has been pushed into the playback ring AND every pushed sample has
+    /// been consumed by the output callback (i.e. handed to the device —
+    /// at most a resampler/output-period tail of a few ms may still be
+    /// sounding). The channel stays open and the thread keeps running for
+    /// reuse. This is what lets `Agent::say` block until playback has
+    /// finished instead of truncating it on drop.
+    ///
+    /// Returns `false` early when the wait is aborted: a [`flush`](Self::flush)
+    /// epoch bump or the playback thread stopping. A wedged output device
+    /// (callback never runs) blocks indefinitely — only flush/stop escapes.
+    pub async fn wait_drained(&self) -> bool {
+        let epoch = self.flush_epoch.load(Ordering::Acquire);
+        let target_clips = self.clips_queued.load(Ordering::SeqCst);
+        // Phase 1: every queued clip is in the ring. Load order matters
+        // (SeqCst throughout): the thread bumps samples_pushed BEFORE
+        // clips_pushed, so once clips_pushed reads ≥ target, the samples
+        // read below includes every one of those clips' samples.
+        let target_samples = loop {
+            if self.drain_aborted(epoch) {
+                return false;
+            }
+            let pushed = self.clips_pushed.load(Ordering::SeqCst);
+            let samples = self.samples_pushed.load(Ordering::SeqCst);
+            if pushed >= target_clips {
+                break samples;
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        };
+        // Phase 2: the output callback has consumed those samples.
+        loop {
+            if self.drain_aborted(epoch) {
+                return false;
+            }
+            if self.samples_consumed.load(Ordering::SeqCst) >= target_samples {
+                return true;
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    /// The shared abort condition for the drain waits: flushed (queued
+    /// audio discarded) or stopped.
+    fn drain_aborted(&self, epoch: u64) -> bool {
+        self.stop.load(Ordering::Relaxed) || self.flush_epoch.load(Ordering::Acquire) != epoch
     }
 }
 
@@ -243,6 +367,9 @@ pub struct OutputPump {
     flush_epoch: Arc<AtomicU64>,
     seen_epoch: u64,
     is_playing: Arc<AtomicBool>,
+    /// Drain bookkeeping: samples popped out of the ring (24 kHz units),
+    /// shared with [`PlaybackHandle::wait_drained`].
+    samples_consumed: Arc<AtomicU64>,
     /// Worst-case frames per [`OutputPump::render`] call the scratch was
     /// sized for (from the negotiated buffer size when known).
     max_period_frames: usize,
@@ -270,6 +397,7 @@ impl OutputPump {
         max_period_frames: usize,
         flush_epoch: Arc<AtomicU64>,
         is_playing: Arc<AtomicBool>,
+        samples_consumed: Arc<AtomicU64>,
     ) -> Self {
         let seen_epoch = flush_epoch.load(Ordering::Acquire);
         let resampler = LinearResampler::new(CLIP_SAMPLE_RATE, device_rate);
@@ -287,6 +415,7 @@ impl OutputPump {
             flush_epoch,
             seen_epoch,
             is_playing,
+            samples_consumed,
             max_period_frames,
             // One block's overshoot at most.
             pending: Vec::with_capacity(block_cap),
@@ -315,6 +444,7 @@ impl OutputPump {
             self.max_period_frames
         );
         let mut written = 0usize;
+        let mut popped = 0u64;
 
         let take = self.pending.len().min(frames);
         out[..take].copy_from_slice(&self.pending[..take]);
@@ -335,6 +465,7 @@ impl OutputPump {
             self.ring_scratch.resize(want, 0.0);
             let got = self.cons.pop_slice(&mut self.ring_scratch);
             self.ring_scratch.truncate(got);
+            popped += got as u64;
             self.resampler
                 .process(&self.ring_scratch, &mut self.block_scratch);
             if self.block_scratch.is_empty() {
@@ -348,6 +479,12 @@ impl OutputPump {
             }
         }
 
+        // Drain bookkeeping: samples that left the ring this period (a
+        // resampler/pending tail of a few ms may still be unemitted — that
+        // bound is documented on `PlaybackHandle::wait_drained`).
+        if popped > 0 {
+            self.samples_consumed.fetch_add(popped, Ordering::SeqCst);
+        }
         out[written..].fill(0.0);
         self.is_playing.store(written > 0, Ordering::Release);
     }
@@ -385,19 +522,23 @@ pub fn push_clip_blocking(
     true
 }
 
-/// Playback thread main loop: owns the stream and is the sole ring pusher.
-/// Pops clips, normalizes their rate to 24 kHz if a producer violates the
-/// contract, pushes under the full-policy, and drains queued clips after a
-/// flush bump so no stale audio can follow a barge-in flush.
-fn playback_loop(
-    stream: cpal::Stream,
+/// Clip→ring pump: the playback thread's loop body, extracted from the
+/// cpal-stream ownership so headless drain tests can drive the real push
+/// path (the stream itself stays in the thread closure). Pops clips,
+/// normalizes their rate to 24 kHz if a producer violates the contract,
+/// pushes under the full-policy, and drains queued clips after a flush
+/// bump so no stale audio can follow a barge-in flush. On each fully
+/// pushed clip it bumps the drain counters (samples first, then the clip
+/// count — [`PlaybackHandle::wait_drained`] reads them in the opposite
+/// order).
+fn clip_pump_loop(
     mut clips_rx: mpsc::Receiver<TtsClip>,
     mut prod: HeapProd<f32>,
-    flush_epoch: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
+    flush_epoch: &AtomicU64,
+    stop: &AtomicBool,
+    clips_pushed: &AtomicU64,
+    samples_pushed: &AtomicU64,
 ) {
-    // The stream plays until this binding is dropped at loop exit.
-    let _stream = stream;
     let mut seen_epoch = flush_epoch.load(Ordering::Acquire);
     while !stop.load(Ordering::Relaxed) {
         match clips_rx.try_recv() {
@@ -411,7 +552,10 @@ fn playback_loop(
                     );
                     resample_offline(&clip.samples, clip.sample_rate, CLIP_SAMPLE_RATE)
                 };
-                if !push_clip_blocking(&mut prod, &samples, &flush_epoch, &mut seen_epoch, &stop) {
+                if push_clip_blocking(&mut prod, &samples, flush_epoch, &mut seen_epoch, stop) {
+                    samples_pushed.fetch_add(samples.len() as u64, Ordering::SeqCst);
+                    clips_pushed.fetch_add(1, Ordering::SeqCst);
+                } else {
                     while clips_rx.try_recv().is_ok() {}
                 }
             }
@@ -475,6 +619,7 @@ mod tests {
             max_period_frames,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         );
         (prod, pump)
     }
@@ -518,5 +663,188 @@ mod tests {
         assert_eq!(pump.ring_scratch.capacity(), ring_cap);
         assert_eq!(pump.block_scratch.capacity(), block_cap);
         assert!(period.iter().all(|&s| s == 0.5));
+    }
+
+    /// Headless drain fixture: the REAL clip→ring pump thread
+    /// (`clip_pump_loop`, no cpal stream) plus a scripted "device" thread
+    /// driving the REAL `OutputPump` one 480-frame period per `period_ms`
+    /// ms (20 ms = realtime at 24 kHz; 0 = free-running). Returns the
+    /// handle, the shared counters, and the stop flag.
+    fn drain_fixture(
+        period_ms: u64,
+    ) -> (
+        PlaybackHandle,
+        DrainCounters,
+        Arc<AtomicBool>,
+        Option<std::thread::JoinHandle<()>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (prod, cons) = HeapRb::<f32>::new(PLAYBACK_RING_CAPACITY).split();
+        let (clips_tx, clips_rx) = mpsc::channel::<TtsClip>(CLIPS_CHANNEL_CAPACITY);
+        let flush_epoch = Arc::new(AtomicU64::new(0));
+        let is_playing = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = DrainCounters::default();
+
+        let pump_thread = std::thread::spawn({
+            let flush_epoch = Arc::clone(&flush_epoch);
+            let stop = Arc::clone(&stop);
+            let counters = counters.clone();
+            move || {
+                clip_pump_loop(
+                    clips_rx,
+                    prod,
+                    &flush_epoch,
+                    &stop,
+                    &counters.clips_pushed,
+                    &counters.samples_pushed,
+                );
+            }
+        });
+        // No consumer thread when period_ms == u64::MAX (the flush-abort
+        // test wedges the device on purpose).
+        let device_thread = (period_ms != u64::MAX).then(|| {
+            std::thread::spawn({
+                let flush_epoch = Arc::clone(&flush_epoch);
+                let is_playing = Arc::clone(&is_playing);
+                let stop = Arc::clone(&stop);
+                let consumed = Arc::clone(&counters.samples_consumed);
+                move || {
+                    let mut pump = OutputPump::new(
+                        cons,
+                        CLIP_SAMPLE_RATE,
+                        480,
+                        flush_epoch,
+                        is_playing,
+                        consumed,
+                    );
+                    let mut period = [0.0f32; 480];
+                    while !stop.load(Ordering::Relaxed) {
+                        pump.render(&mut period);
+                        if period_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(period_ms));
+                        }
+                    }
+                }
+            })
+        });
+
+        let handle = PlaybackHandle {
+            clips_tx,
+            flush_epoch,
+            is_playing,
+            sample_rate: CLIP_SAMPLE_RATE,
+            stop: Arc::clone(&stop),
+            clips_queued: Arc::clone(&counters.clips_queued),
+            clips_pushed: Arc::clone(&counters.clips_pushed),
+            samples_pushed: Arc::clone(&counters.samples_pushed),
+            samples_consumed: Arc::clone(&counters.samples_consumed),
+        };
+        (handle, counters, stop, device_thread, pump_thread)
+    }
+
+    /// The shared drain counters (mirrors `Playback::start`'s wiring).
+    #[derive(Clone, Default)]
+    struct DrainCounters {
+        clips_queued: Arc<AtomicU64>,
+        clips_pushed: Arc<AtomicU64>,
+        samples_pushed: Arc<AtomicU64>,
+        samples_consumed: Arc<AtomicU64>,
+    }
+
+    fn clip(samples: usize) -> TtsClip {
+        TtsClip {
+            samples: vec![0.5f32; samples],
+            sample_rate: CLIP_SAMPLE_RATE,
+        }
+    }
+
+    /// The `--say` truncation regression: `wait_drained` must not return
+    /// until every queued sample has been consumed by the output callback.
+    /// With a realtime-paced fake device, 750 ms of audio keeps the wait
+    /// parked for roughly the playback duration (before the fix, `say`
+    /// returned after queueing and `Agent::drop` killed the thread within
+    /// ~5 ms — a 660 ms clip became a ~10 ms blip on real hardware).
+    #[tokio::test]
+    async fn wait_drained_returns_after_all_samples_consumed() {
+        let (handle, counters, stop, device, pump) = drain_fixture(20);
+        let total = 3 * 6_000u64; // 3 × 250 ms @ 24 kHz
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            handle.queue_clip(clip(6_000)).await.expect("queue");
+        }
+        let drained = tokio::time::timeout(Duration::from_secs(10), handle.wait_drained())
+            .await
+            .expect("graceful drain must not hang");
+        assert!(drained, "drained (not aborted)");
+        assert!(
+            counters.samples_consumed.load(Ordering::SeqCst) >= total,
+            "all queued samples consumed before finish returned: {}",
+            counters.samples_consumed.load(Ordering::SeqCst)
+        );
+        assert_eq!(counters.clips_pushed.load(Ordering::SeqCst), 3);
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "wait blocked for roughly the playback duration: {:?}",
+            started.elapsed()
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        device.expect("device thread").join().expect("device join");
+        pump.join().expect("pump join");
+    }
+
+    /// A flush-epoch bump aborts the drain wait promptly (the queued audio
+    /// is being discarded — waiting for it would hang a barge-in).
+    #[tokio::test]
+    async fn wait_drained_aborts_promptly_on_flush() {
+        // Wedged device (no consumer): clips reach the ring, then the wait
+        // parks in the consumption phase forever unless aborted.
+        let (handle, counters, stop, device, pump) = drain_fixture(u64::MAX);
+        handle.queue_clip(clip(6_000)).await.expect("queue");
+        // Let the pump thread land the clip in the ring.
+        for _ in 0..100 {
+            if counters.clips_pushed.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(counters.clips_pushed.load(Ordering::SeqCst), 1);
+
+        let h2 = handle.clone();
+        let waiter = tokio::spawn(async move { h2.wait_drained().await });
+        tokio::time::sleep(Duration::from_millis(50)).await; // parked now
+        assert!(
+            !waiter.is_finished(),
+            "sanity: wedged device parks the wait"
+        );
+        handle.flush();
+        let drained = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("flush must abort the wait promptly")
+            .expect("wait task panicked");
+        assert!(!drained, "aborted by the flush");
+
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("pump join");
+        assert!(device.is_none());
+    }
+
+    /// `wait_buffered` returns once every queued clip is in the ring, even
+    /// with a wedged device (nothing consumed yet).
+    #[tokio::test]
+    async fn wait_buffered_covers_queue_only() {
+        let (handle, counters, stop, device, pump) = drain_fixture(u64::MAX);
+        handle.queue_clip(clip(6_000)).await.expect("queue");
+        let buffered = tokio::time::timeout(Duration::from_secs(2), handle.wait_buffered())
+            .await
+            .expect("buffered wait must not hang");
+        assert!(buffered);
+        assert_eq!(counters.clips_pushed.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.samples_consumed.load(Ordering::SeqCst), 0);
+
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("pump join");
+        assert!(device.is_none());
     }
 }

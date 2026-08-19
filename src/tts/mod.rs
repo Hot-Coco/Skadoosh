@@ -37,6 +37,18 @@ pub trait TtsEngine: Send {
     fn synthesize(&mut self, text: &str) -> Result<TtsClip>;
 }
 
+/// Concatenates clip samples into one buffer (shared by
+/// [`Agent::say_to_wav`](crate::agent::Agent::say_to_wav) and the pipeline's
+/// `--selftest` wav writer).
+pub(crate) fn concat_clip_samples(clips: &[TtsClip]) -> Vec<f32> {
+    let total: usize = clips.iter().map(|c| c.samples.len()).sum();
+    let mut pcm = Vec::with_capacity(total);
+    for clip in clips {
+        pcm.extend_from_slice(&clip.samples);
+    }
+    pcm
+}
+
 /// Builds the engine: [`OnnxTts`] when `--mock-tts` is unset and the Kokoro
 /// model + voices files exist; otherwise [`MockTts`] with a `tracing::warn!`.
 ///

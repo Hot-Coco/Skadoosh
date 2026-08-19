@@ -12,11 +12,12 @@
 //! conventional 128+SIGINT status, so a wedged shutdown can always be
 //! killed.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
 use skadoosh::audio::input::list_devices;
-use skadoosh::{Config, Pipeline, SkadooshError};
+use skadoosh::{Agent, AgentEvent, Config, OutputMode, Pipeline, SkadooshError};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
@@ -46,29 +47,111 @@ fn dispatch(config: Config) -> skadoosh::Result<()> {
         return Ok(());
     }
 
-    let selftest = config.selftest.clone();
-    let pipeline = Pipeline::new(config)?;
-    match selftest {
-        Some(wav) => {
-            let report = pipeline.run_selftest(&wav, Path::new("selftest_out.wav"))?;
-            println!("{report}");
-            Ok(())
-        }
-        None => {
-            // Bridge SIGINT onto the shutdown token so a clean ctrlc exits 0.
-            let token = pipeline.shutdown_token();
-            let bridge = sigint::install(token.clone());
-            let result = pipeline.run();
-            // Signal the bridge that the pipeline is done (so its thread
-            // exits instead of waiting for a second SIGINT), and cover the
-            // case where `run` returned before touching the token (e.g.
-            // AudioError::NoDevice).
-            bridge.done();
-            token.cancel();
-            if let Some(handle) = bridge.join {
-                let _ = handle.join();
+    if let Some(wav) = config.selftest.clone() {
+        let pipeline = Pipeline::new(config)?;
+        let report = pipeline.run_selftest(&wav, Path::new("selftest_out.wav"))?;
+        println!("{report}");
+        return Ok(());
+    }
+
+    let mut agent = Agent::builder().config(config.clone()).build()?;
+
+    if config.repl {
+        // Interactive text↔text loop: no audio, no models. (`StdinLock`/
+        // `StdoutLock` are !Send and `Stdin` is not `BufRead`, hence the
+        // unlocked, buffered handles.)
+        return agent.repl(std::io::BufReader::new(std::io::stdin()), std::io::stdout());
+    }
+
+    if let Some(text) = &config.say {
+        return match &config.out_wav {
+            // No audio device needed.
+            Some(path) => agent.say_to_wav(text, path),
+            None => agent.say(text),
+        };
+    }
+
+    // The voice loop. In --output text mode, print transcripts and streamed
+    // reply clauses instead of playing audio.
+    if config.output == OutputMode::Text {
+        let events = agent.events();
+        let out: Box<dyn Write + Send> = Box::new(std::io::stdout());
+        std::thread::spawn(move || print_text_mode(events, out));
+    }
+
+    // Bridge SIGINT onto the shutdown token so a clean ctrlc exits 0.
+    let token = agent.shutdown_token();
+    let bridge = sigint::install(token.clone());
+    let result = agent.run();
+    // Signal the bridge that the pipeline is done (so its thread exits
+    // instead of waiting for a second SIGINT), and cover the case where
+    // `run` returned before touching the token (e.g. AudioError::NoDevice).
+    bridge.done();
+    token.cancel();
+    if let Some(handle) = bridge.join {
+        let _ = handle.join();
+    }
+    result
+}
+
+/// `--output text` printer: `you: <transcript>`, then the reply's clauses
+/// as they stream on one `bot: ...` line per turn.
+fn print_text_mode(
+    mut events: tokio::sync::broadcast::Receiver<AgentEvent>,
+    mut out: Box<dyn Write + Send>,
+) {
+    let mut mid_reply = false;
+    loop {
+        match events.blocking_recv() {
+            Ok(AgentEvent::Transcript(text)) => {
+                if mid_reply {
+                    let _ = writeln!(out);
+                    mid_reply = false;
+                }
+                if writeln!(out, "you: {}", text.trim()).is_err() {
+                    return;
+                }
             }
-            result
+            Ok(AgentEvent::Clause(clause)) => {
+                if mid_reply {
+                    let _ = write!(out, " ");
+                } else {
+                    let _ = write!(out, "bot: ");
+                    mid_reply = true;
+                }
+                if write!(out, "{}", clause.trim()).is_err() || out.flush().is_err() {
+                    return;
+                }
+            }
+            Ok(AgentEvent::ReplyDone) => {
+                if mid_reply {
+                    mid_reply = false;
+                    if writeln!(out).is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(AgentEvent::TurnCancelled) => {
+                if mid_reply {
+                    mid_reply = false;
+                    if writeln!(out).is_err() {
+                        return;
+                    }
+                }
+                if writeln!(out, "  [interrupted]").is_err() {
+                    return;
+                }
+            }
+            Ok(AgentEvent::Error(err)) => {
+                if writeln!(out, "error: {err}").is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                let _ = writeln!(out, "  [... {n} events dropped ...]");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }

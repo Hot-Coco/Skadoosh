@@ -54,20 +54,21 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use ringbuf::traits::{Consumer, Observer};
 use ringbuf::HeapCons;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, info_span, warn, Instrument};
 
+use crate::agent::{AgentEvent, EVENT_CAP};
 use crate::audio::{
     resample_offline, AudioInputConfig, AudioOutputConfig, MicCapture, Playback, PlaybackHandle,
     CAPTURE_RATE,
 };
-use crate::config::Config;
+use crate::config::{Config, OutputMode};
 use crate::error::{LlmError, Result, SkadooshError, SttError};
 use crate::llm::client::{ensure_success, SseLineBuffer, CLAUSE_MAX_LEN, CLAUSE_MIN_LEN};
-use crate::llm::{parse_sse_line, ClauseSplitter, LlmClient};
-use crate::stt::{SttConfig, WhisperStt};
-use crate::tts::{build_engine, TtsClip, TtsEngine, TTS_SAMPLE_RATE};
+use crate::llm::{parse_sse_line, ClauseSplitter, LlmBackend, LlmClient};
+use crate::stt::{SttConfig, SttEngine, WhisperStt};
+use crate::tts::{build_engine, concat_clip_samples, TtsClip, TtsEngine, TTS_SAMPLE_RATE};
 use crate::vad::{SileroVad, VadEvent, VadSegmenter, FRAME_LEN};
 
 /// VAD-events channel capacity (§7).
@@ -121,20 +122,17 @@ impl fmt::Display for SelftestReport {
     /// Renders the latency table printed by `skadoosh --selftest`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "skadoosh selftest — latency report")?;
-        writeln!(f, "  {:<30} {:>8} ms", "vad segmentation", self.segment_ms)?;
-        writeln!(f, "  {:<30} {:>8} ms", "stt (whisper)", self.stt_ms)?;
-        writeln!(
-            f,
-            "  {:<30} {:>8} ms",
-            "llm time-to-first-token", self.llm_ttft_ms
-        )?;
-        writeln!(
-            f,
-            "  {:<30} {:>8} ms",
-            "llm first clause", self.first_clause_ms
-        )?;
-        writeln!(f, "  {:<30} {:>8} ms", "tts first clip", self.tts_ms)?;
-        writeln!(f, "  {:<30} {:>8} ms", "total", self.total_ms)?;
+        let rows = [
+            ("vad segmentation", self.segment_ms),
+            ("stt (whisper)", self.stt_ms),
+            ("llm time-to-first-token", self.llm_ttft_ms),
+            ("llm first clause", self.first_clause_ms),
+            ("tts first clip", self.tts_ms),
+            ("total", self.total_ms),
+        ];
+        for (label, ms) in rows {
+            writeln!(f, "  {label:<30} {ms:>8} ms")?;
+        }
         write!(f, "  transcript: {:?}", self.transcript)
     }
 }
@@ -146,19 +144,57 @@ impl fmt::Display for SelftestReport {
 /// `SpeechStart` while playback is active cancels the per-turn token and
 /// flushes playback; a `turn_id` tags turns so stale clips/text are dropped
 /// defensively. STT is never cancelled.
+///
+/// [`Pipeline::new`] builds every stage from the [`Config`] (the binary's
+/// path); `Pipeline::from_parts` (crate-internal) additionally injects
+/// engine trait objects and the event bus — that is how the
+/// [`Agent`](crate::agent::Agent) SDK facade drives the same machinery.
+/// In [`OutputMode::Text`] no TTS engine or playback device is built: the
+/// TTS task drains clauses and surfaces them as
+/// [`AgentEvent::Clause`]s instead of synthesizing audio.
 pub struct Pipeline {
     config: Config,
     shutdown: CancellationToken,
+    stt: Option<Box<dyn SttEngine>>,
+    llm: Option<Box<dyn LlmBackend>>,
+    tts: Option<Box<dyn TtsEngine>>,
+    events: broadcast::Sender<AgentEvent>,
 }
 
 impl Pipeline {
     /// Creates the pipeline from a validated [`Config`]. Tasks are spawned by
     /// [`Pipeline::run`]; no devices are opened or models loaded until then.
     pub fn new(config: Config) -> Result<Self> {
-        Ok(Self {
+        let (events, _) = broadcast::channel(EVENT_CAP);
+        Ok(Self::from_parts(
             config,
-            shutdown: CancellationToken::new(),
-        })
+            CancellationToken::new(),
+            events,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    /// Creates the pipeline with SDK-injected stages and shared
+    /// shutdown/event handles. Any stage left `None` is built from the
+    /// config exactly as [`Pipeline::new`] would at `run()` time.
+    pub(crate) fn from_parts(
+        config: Config,
+        shutdown: CancellationToken,
+        events: broadcast::Sender<AgentEvent>,
+        stt: Option<Box<dyn SttEngine>>,
+        llm: Option<Box<dyn LlmBackend>>,
+        tts: Option<Box<dyn TtsEngine>>,
+    ) -> Self {
+        Self {
+            config,
+            shutdown,
+            stt,
+            llm,
+            tts,
+            events,
+        }
     }
 
     /// A clone of the shutdown token. Cancelling it requests a graceful
@@ -176,80 +212,82 @@ impl Pipeline {
     /// the models, builds a multi-threaded tokio runtime, and blocks until
     /// the orchestrator exits. Returns `Err` only on a real fatal error; a
     /// requested shutdown is `Ok(())`.
+    ///
+    /// In [`OutputMode::Text`] no output device is opened and no TTS engine
+    /// is built — replies surface as [`AgentEvent::Clause`]s instead of
+    /// audio (the binary prints them).
     pub fn run(self) -> Result<()> {
-        let Self { config, shutdown } = self;
+        let Self {
+            config,
+            shutdown,
+            stt,
+            llm,
+            tts,
+            events,
+        } = self;
 
         // Sources first: fail fast with a clean AudioError on headless
-        // machines, before paying for model loads.
+        // machines, before paying for model loads. In audio mode that is
+        // BOTH devices (the v1 ordering — the v0.2 text-mode split had
+        // moved playback behind the model loads, so a missing output
+        // device was only reported after two model loads).
         let (capture, cons) = MicCapture::start(&AudioInputConfig {
             device_name: config.input_device.clone(),
         })?;
-        let (playback, handle) = Playback::start(&AudioOutputConfig {
-            device_name: config.output_device.clone(),
-        })?;
+        let playback = match config.output {
+            OutputMode::Audio => Some(Playback::start(&AudioOutputConfig {
+                device_name: config.output_device.clone(),
+            })?),
+            OutputMode::Text => None,
+        };
         let vad = SileroVad::new(&config.vad_model)?;
         let segmenter = VadSegmenter::new(config.vad_threshold, config.silence_ms);
-        let stt = WhisperStt::start(&config.whisper_model, &SttConfig::default())?;
-        let tts_engine = build_engine(&config)?;
-        let llm = LlmClient::new(
-            &config.llm_url,
-            &config.llm_model,
-            &config.system_prompt,
-            config.max_history_turns,
-        );
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| anyhow::anyhow!("failed to start tokio runtime: {err}"))?;
-
-        let result = runtime.block_on(async move {
-            let (vad_tx, vad_rx) = mpsc::channel(VAD_EVENTS_CAP);
-            let (fatal_tx, fatal_rx) = mpsc::channel(FATAL_CAP);
-            let vad_join = tokio::spawn(
-                vad_task(VadParts {
-                    capture,
-                    cons,
-                    vad,
-                    segmenter,
-                    threshold: config.vad_threshold,
-                    sink: handle.clone(),
-                    events_tx: vad_tx,
-                    fatal_tx: fatal_tx.clone(),
-                    shutdown: shutdown.clone(),
-                })
-                .instrument(info_span!("vad")),
-            );
-            let result = run_orchestrator(Topology {
-                vad_events: vad_rx,
-                fatal_tx,
-                fatal_rx,
-                stt,
-                llm,
-                tts_engine,
-                sink: handle.clone(),
-                shutdown,
-            })
-            .await;
-            // The orchestrator cancelled the shutdown token on its way out,
-            // so the VAD task is already exiting; collect it.
-            match vad_join.await {
-                Ok(()) => {}
-                Err(join_err) => {
-                    warn!(error = %join_err, "VAD task panicked");
-                    if result.is_ok() {
-                        return Err(anyhow::anyhow!("VAD task panicked: {join_err}").into());
-                    }
-                }
+        let stt: Box<dyn SttEngine> = match stt {
+            Some(stt) => {
+                info!(engine = stt.name(), "using injected STT engine");
+                stt
             }
-            result
-        });
+            None => Box::new(WhisperStt::start(
+                &config.whisper_model,
+                &SttConfig::default(),
+            )?),
+        };
+        let llm: Box<dyn LlmBackend> = match llm {
+            Some(llm) => {
+                info!(backend = llm.name(), "using injected LLM backend");
+                llm
+            }
+            None => Box::new(LlmClient::from_config(&config)),
+        };
+        let tts = match (tts, config.output) {
+            (Some(tts), OutputMode::Audio) => {
+                info!(engine = "injected", "using injected TTS engine");
+                Some(tts)
+            }
+            (Some(_), OutputMode::Text) => {
+                warn!("--output text: injected TTS engine ignored (no audio is synthesized)");
+                None
+            }
+            (None, OutputMode::Audio) => Some(build_engine(&config)?),
+            (None, OutputMode::Text) => None,
+        };
 
-        // Every PlaybackHandle clone was dropped with the tasks above, so
-        // the playback thread has seen the channel close (stop() also sets
-        // the stop flag) and joins promptly.
-        playback.stop();
-        result
+        match (config.output, playback) {
+            (OutputMode::Audio, Some((playback, handle))) => {
+                let result = run_loop(
+                    capture, cons, vad, segmenter, &config, stt, llm, tts, handle, shutdown, events,
+                );
+                // Every PlaybackHandle clone was dropped with the tasks
+                // above, so the playback thread has seen the channel close
+                // (stop() also sets the stop flag) and joins promptly.
+                playback.stop();
+                result
+            }
+            (OutputMode::Text, None) => run_loop(
+                capture, cons, vad, segmenter, &config, stt, llm, tts, NullSink, shutdown, events,
+            ),
+            _ => unreachable!("playback is opened exactly in audio mode"),
+        }
     }
 
     /// Headless self-test: no cpal. Loads `wav`, resamples to 16 kHz, feeds
@@ -266,6 +304,91 @@ impl Pipeline {
             .build()
             .map_err(|err| anyhow::anyhow!("failed to start tokio runtime: {err}"))?;
         runtime.block_on(self.selftest_async(wav, out_wav))
+    }
+}
+
+/// `Pipeline::run`'s task/runtime body, generic over the clip sink so text
+/// mode can substitute [`NullSink`] for the real [`PlaybackHandle`].
+#[allow(clippy::too_many_arguments)]
+fn run_loop<C: ClipSink>(
+    capture: MicCapture,
+    cons: HeapCons<f32>,
+    vad: SileroVad,
+    segmenter: VadSegmenter,
+    config: &Config,
+    stt: Box<dyn SttEngine>,
+    llm: Box<dyn LlmBackend>,
+    tts: Option<Box<dyn TtsEngine>>,
+    sink: C,
+    shutdown: CancellationToken,
+    events: broadcast::Sender<AgentEvent>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to start tokio runtime: {err}"))?;
+
+    runtime.block_on(async move {
+        let (vad_tx, vad_rx) = mpsc::channel(VAD_EVENTS_CAP);
+        let (fatal_tx, fatal_rx) = mpsc::channel(FATAL_CAP);
+        let vad_join = tokio::spawn(
+            vad_task(VadParts {
+                capture,
+                cons,
+                vad,
+                segmenter,
+                threshold: config.vad_threshold,
+                sink: sink.clone(),
+                events_tx: vad_tx,
+                fatal_tx: fatal_tx.clone(),
+                shutdown: shutdown.clone(),
+                events: events.clone(),
+            })
+            .instrument(info_span!("vad")),
+        );
+        let result = run_orchestrator(Topology {
+            vad_events: vad_rx,
+            fatal_tx,
+            fatal_rx,
+            stt,
+            llm,
+            tts_engine: tts,
+            sink,
+            shutdown,
+            events,
+        })
+        .await;
+        // The orchestrator cancelled the shutdown token on its way out,
+        // so the VAD task is already exiting; collect it.
+        match vad_join.await {
+            Ok(()) => {}
+            Err(join_err) => {
+                warn!(error = %join_err, "VAD task panicked");
+                if result.is_ok() {
+                    return Err(anyhow::anyhow!("VAD task panicked: {join_err}").into());
+                }
+            }
+        }
+        result
+    })
+}
+
+/// Clip sink for [`OutputMode::Text`]: no playback device is opened, clips
+/// are never queued (text mode builds no TTS engine), playback is never
+/// audible — so a `SpeechStart` never flushes/cancels (the "silent-gap"
+/// rule) and a fresh segment still supersedes a stale turn.
+#[derive(Debug, Clone, Copy, Default)]
+struct NullSink;
+
+impl ClipSink for NullSink {
+    async fn queue_clip(&self, _clip: TtsClip) -> Result<()> {
+        Err(anyhow::anyhow!("NullSink received a clip; text mode synthesizes no audio").into())
+    }
+
+    fn flush(&self) {}
+
+    fn is_playing(&self) -> bool {
+        false
     }
 }
 
@@ -287,59 +410,6 @@ pub enum VadEventMsg {
         /// Segmenter close instant (§8 `t_speech_end`).
         t_speech_end: Instant,
     },
-}
-
-/// Speech-to-text seam used by the orchestrator's STT bridge.
-///
-/// Implemented by [`WhisperStt`] in production; integration tests inject a
-/// scripted double. Public for testability; not part of the stable
-/// embedding API.
-#[doc(hidden)]
-pub trait SpeechToText: Send + 'static {
-    /// Transcribes one 16 kHz f32 segment.
-    fn transcribe(
-        &self,
-        samples: Vec<f32>,
-    ) -> impl std::future::Future<Output = Result<String>> + Send;
-    /// Total jobs dropped because the bounded queue was full (drop-oldest
-    /// policy). Used to tell an evicted job (benign) from a dead worker
-    /// (fatal).
-    fn dropped_jobs(&self) -> u64 {
-        0
-    }
-    /// Stops the worker, joining its thread. Called by the STT bridge task
-    /// during shutdown drain.
-    fn stop(self)
-    where
-        Self: Sized,
-    {
-    }
-}
-
-impl SpeechToText for WhisperStt {
-    fn transcribe(
-        &self,
-        samples: Vec<f32>,
-    ) -> impl std::future::Future<Output = Result<String>> + Send {
-        let reply = WhisperStt::transcribe(self, samples);
-        async move {
-            // A closed reply channel means the job was evicted (drop-oldest)
-            // or the worker is gone; the bridge distinguishes the two via
-            // `dropped_jobs`.
-            match reply.await {
-                Ok(result) => result,
-                Err(_) => Err(SttError::WorkerGone.into()),
-            }
-        }
-    }
-
-    fn dropped_jobs(&self) -> u64 {
-        WhisperStt::dropped_jobs(self)
-    }
-
-    fn stop(self) {
-        WhisperStt::stop(self);
-    }
 }
 
 /// Clip sink seam: playback in production, a scripted recorder in tests.
@@ -372,9 +442,14 @@ impl ClipSink for PlaybackHandle {
 
 /// Everything [`run_orchestrator`] needs: the injected channel ends and the
 /// stage implementations. Public so integration tests can drive the
-/// orchestrator without cpal/whisper; not part of the stable embedding API.
+/// orchestrator without cpal/whisper; not part of the stable embedding API
+/// (SDK users should go through [`Agent`](crate::agent::Agent)).
+///
+/// `tts_engine: None` selects text mode: the TTS task synthesizes nothing
+/// and surfaces clauses as [`AgentEvent::Clause`]s (pair it with a
+/// null [`ClipSink`]).
 #[doc(hidden)]
-pub struct Topology<S: SpeechToText, C: ClipSink> {
+pub struct Topology<C: ClipSink> {
     /// VAD events (from the VAD task in production; scripted in tests).
     pub vad_events: mpsc::Receiver<VadEventMsg>,
     /// Fatal-error channel: send end (cloned into every task).
@@ -382,15 +457,17 @@ pub struct Topology<S: SpeechToText, C: ClipSink> {
     /// Fatal-error channel: receive end (owned by the orchestrator, §6).
     pub fatal_rx: mpsc::Receiver<SkadooshError>,
     /// STT stage.
-    pub stt: S,
+    pub stt: Box<dyn SttEngine>,
     /// LLM stage (already pointed at the serving endpoint).
-    pub llm: LlmClient,
-    /// TTS stage.
-    pub tts_engine: Box<dyn TtsEngine>,
+    pub llm: Box<dyn LlmBackend>,
+    /// TTS stage, or `None` for text mode (no synthesis).
+    pub tts_engine: Option<Box<dyn TtsEngine>>,
     /// Clip sink (playback handle in production).
     pub sink: C,
     /// Shutdown token; cancelled by the orchestrator on the way out.
     pub shutdown: CancellationToken,
+    /// Agent-event broadcast; every stage reports through it.
+    pub events: broadcast::Sender<AgentEvent>,
 }
 
 /// A segment forwarded by the orchestrator to the STT bridge.
@@ -475,6 +552,7 @@ struct VadParts<C: ClipSink> {
     events_tx: mpsc::Sender<VadEventMsg>,
     fatal_tx: mpsc::Sender<SkadooshError>,
     shutdown: CancellationToken,
+    events: broadcast::Sender<AgentEvent>,
 }
 
 /// VAD task (§7 task 2): drains the mic ring in 512-sample frames, runs
@@ -494,6 +572,7 @@ async fn vad_task<C: ClipSink>(parts: VadParts<C>) {
         events_tx,
         fatal_tx,
         shutdown,
+        events,
     } = parts;
     // Owned here; dropping it at task exit stops the mic stream (§6 "stop
     // event sources").
@@ -523,6 +602,7 @@ async fn vad_task<C: ClipSink>(parts: VadParts<C>) {
             Ok(prob) => prob,
             Err(err) => {
                 // Inference failures are permanent: report fatal and exit.
+                emit_error(&events, &err);
                 let _ = fatal_tx.send(err).await;
                 break;
             }
@@ -531,6 +611,9 @@ async fn vad_task<C: ClipSink>(parts: VadParts<C>) {
         let event = segmenter.push(&frame, prob);
         let is_start = matches!(event, Some(VadEvent::SpeechStart));
         let forward_start = gate.filter(is_start, is_speech, sink.is_playing());
+        if forward_start {
+            emit(&events, AgentEvent::SpeechStart);
+        }
         let msg = match event {
             Some(VadEvent::Segment(samples)) => {
                 vad.reset_state();
@@ -556,18 +639,36 @@ async fn vad_task<C: ClipSink>(parts: VadParts<C>) {
     }
 }
 
+/// Context shared by the STT/LLM/TTS stage tasks (bundled to stay under
+/// the argument lint). All fields are cheap shared-handle clones.
+#[derive(Clone)]
+struct StageCtx {
+    /// The current (latest) turn id; stale-turn drops compare against it.
+    current_turn: Arc<AtomicU64>,
+    /// Pipeline-wide shutdown.
+    shutdown: CancellationToken,
+    /// Fatal-error channel (§6).
+    fatal_tx: mpsc::Sender<SkadooshError>,
+    /// Agent-event broadcast.
+    events: broadcast::Sender<AgentEvent>,
+}
+
 /// STT bridge (§7 task 4): segment → `transcribe` oneshot await → text
 /// mpsc. STT is never cancelled (§8); the only early-abandon is shutdown.
 /// Stale turns (superseded while whisper ran) are dropped defensively; an
 /// evicted job (drop-oldest) is benign, a dead worker is fatal.
-async fn stt_bridge<S: SpeechToText>(
+async fn stt_bridge(
     mut segment_rx: mpsc::Receiver<SegmentMsg>,
     text_tx: mpsc::Sender<TextMsg>,
-    stt: S,
-    current_turn: Arc<AtomicU64>,
-    shutdown: CancellationToken,
-    fatal_tx: mpsc::Sender<SkadooshError>,
+    stt: Box<dyn SttEngine>,
+    ctx: StageCtx,
 ) {
+    let StageCtx {
+        current_turn,
+        shutdown,
+        fatal_tx,
+        events,
+    } = ctx;
     loop {
         let msg = tokio::select! {
             biased;
@@ -588,10 +689,15 @@ async fn stt_bridge<S: SpeechToText>(
             continue;
         }
         let dropped_before = stt.dropped_jobs();
+        // A closed reply channel means the job was evicted (drop-oldest) or
+        // the worker is gone; `dropped_jobs` tells the two apart below.
         let result = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
-            result = stt.transcribe(samples) => result,
+            reply = stt.transcribe(samples) => match reply {
+                Ok(result) => result,
+                Err(_) => Err(SttError::WorkerGone.into()),
+            },
         };
         let text = match result {
             Ok(text) => text,
@@ -605,6 +711,7 @@ async fn stt_bridge<S: SpeechToText>(
                     continue;
                 }
                 warn!(turn_id, error = %err, "fatal STT error");
+                emit_error(&events, &err);
                 let _ = fatal_tx.send(err).await;
                 break;
             }
@@ -633,9 +740,9 @@ async fn stt_bridge<S: SpeechToText>(
             if shutdown.is_cancelled() {
                 break;
             }
-            let _ = fatal_tx
-                .send(anyhow::anyhow!("LLM task channel closed unexpectedly").into())
-                .await;
+            let err: SkadooshError = anyhow::anyhow!("LLM task channel closed unexpectedly").into();
+            emit_error(&events, &err);
+            let _ = fatal_tx.send(err).await;
             break;
         }
     }
@@ -656,11 +763,15 @@ async fn llm_task(
     mut text_rx: mpsc::Receiver<TextMsg>,
     turn_tx: mpsc::Sender<TurnMsg>,
     turn_done_tx: mpsc::Sender<u64>,
-    mut client: LlmClient,
-    current_turn: Arc<AtomicU64>,
-    shutdown: CancellationToken,
-    fatal_tx: mpsc::Sender<SkadooshError>,
+    mut client: Box<dyn LlmBackend>,
+    ctx: StageCtx,
 ) {
+    let StageCtx {
+        current_turn,
+        shutdown,
+        fatal_tx,
+        events,
+    } = ctx;
     loop {
         let msg = tokio::select! {
             biased;
@@ -698,12 +809,13 @@ async fn llm_task(
             if shutdown.is_cancelled() {
                 break;
             }
-            let _ = fatal_tx
-                .send(anyhow::anyhow!("TTS task channel closed unexpectedly").into())
-                .await;
+            let err: SkadooshError = anyhow::anyhow!("TTS task channel closed unexpectedly").into();
+            emit_error(&events, &err);
+            let _ = fatal_tx.send(err).await;
             break;
         }
         info!(turn_id, %text, "LLM turn started");
+        emit(&events, AgentEvent::Transcript(text.clone()));
         let result = client.stream_reply(&text, clause_tx, token).await;
         // Best effort: the orchestrator marks the turn stream-done (keeping
         // the token live for barge-in against the TTS backlog); a lost
@@ -719,6 +831,7 @@ async fn llm_task(
             }
             Err(err) => {
                 warn!(turn_id, error = %err, "fatal LLM error");
+                emit_error(&events, &err);
                 let _ = fatal_tx.send(err).await;
                 break;
             }
@@ -731,14 +844,24 @@ async fn llm_task(
 /// after each synthesis, so a cancelled turn emits no further clips; stale
 /// `turn_id`s are dropped defensively. The first queued clip spawns the
 /// first-audible watcher that logs the per-turn latency summary (§8).
+///
+/// Text mode ([`OutputMode::Text`], `engine == None`): nothing is
+/// synthesized and the sink is never touched — each clause is surfaced as
+/// an [`AgentEvent::Clause`] (the binary prints them) and the per-turn
+/// [`AgentEvent::StageLatency`] is emitted when the stream ends (with
+/// `tts_ms`/`playback_ms` zeroed: those stages do not exist in text mode).
 async fn tts_task<C: ClipSink>(
     mut turn_rx: mpsc::Receiver<TurnMsg>,
-    mut engine: Box<dyn TtsEngine>,
+    mut engine: Option<Box<dyn TtsEngine>>,
     sink: C,
-    current_turn: Arc<AtomicU64>,
-    shutdown: CancellationToken,
-    fatal_tx: mpsc::Sender<SkadooshError>,
+    ctx: StageCtx,
 ) {
+    let StageCtx {
+        current_turn,
+        shutdown,
+        fatal_tx,
+        events,
+    } = ctx;
     'outer: loop {
         let turn = tokio::select! {
             biased;
@@ -776,20 +899,29 @@ async fn tts_task<C: ClipSink>(
                 debug!(turn_id, "dropping stale clause");
                 continue;
             }
-            let (returned_engine, result) = match synthesize_clause(engine, clause).await {
+            timing.t_first_clause.get_or_insert(t_clause);
+            emit(&events, AgentEvent::Clause(clause.clone()));
+            // Text mode: no synthesis; the clause event above is the whole
+            // output path for it. (On the panic path below `engine` stays
+            // `None` — but the task exits anyway, so no turn can observe it.)
+            let Some(owned) = engine.take() else {
+                continue;
+            };
+            let (returned_engine, result) = match synthesize_clause(owned, clause).await {
                 Ok(pair) => pair,
                 Err(join_err) => {
                     // The engine unwound with the panic; always fatal.
                     if !shutdown.is_cancelled() {
                         warn!(turn_id, error = %join_err, "TTS synthesis panicked");
-                        let _ = fatal_tx
-                            .send(anyhow::anyhow!("TTS synthesis panicked: {join_err}").into())
-                            .await;
+                        let err: SkadooshError =
+                            anyhow::anyhow!("TTS synthesis panicked: {join_err}").into();
+                        emit_error(&events, &err);
+                        let _ = fatal_tx.send(err).await;
                     }
                     break 'outer;
                 }
             };
-            engine = returned_engine;
+            engine = Some(returned_engine);
             let clip = match result {
                 Ok(clip) => clip,
                 Err(err) => {
@@ -797,6 +929,7 @@ async fn tts_task<C: ClipSink>(
                         break 'turn; // unwind in progress: benign
                     }
                     warn!(turn_id, error = %err, "fatal TTS error");
+                    emit_error(&events, &err);
                     let _ = fatal_tx.send(err).await;
                     break 'outer;
                 }
@@ -805,7 +938,6 @@ async fn tts_task<C: ClipSink>(
                 debug!(turn_id, "discarding clip synthesized after cancel");
                 continue;
             }
-            timing.t_first_clause.get_or_insert(t_clause);
             let queued = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break 'outer,
@@ -817,16 +949,64 @@ async fn tts_task<C: ClipSink>(
                     break 'turn;
                 }
                 warn!(turn_id, error = %err, "fatal playback error");
+                emit_error(&events, &err);
                 let _ = fatal_tx.send(err).await;
                 break 'outer;
             }
             if timing.t_first_clip.is_none() {
                 timing.t_first_clip = Some(Instant::now());
                 tokio::spawn(
-                    audible_watcher(sink.clone(), token.clone(), turn_id, timing.clone())
-                        .instrument(info_span!("playback")),
+                    audible_watcher(
+                        sink.clone(),
+                        token.clone(),
+                        turn_id,
+                        timing.clone(),
+                        events.clone(),
+                    )
+                    .instrument(info_span!("playback")),
                 );
             }
+        }
+        // Turn ended: if the clause channel closed cleanly (LLM stream
+        // done, not cancelled), every Clause event for the turn has been
+        // emitted — only NOW is the reply done (ordered after the clauses
+        // and the latency summary).
+        if !token.is_cancelled() && !shutdown.is_cancelled() {
+            // Text mode: report the per-turn latency at stream end (the
+            // audible_watcher reports it in audio mode).
+            if engine.is_none() {
+                if let Some(t_clause) = timing.t_first_clause {
+                    let now = Instant::now();
+                    let stt_ms = millis(timing.t_text - timing.t_speech_end);
+                    let llm_ms = millis(t_clause - timing.t_text);
+                    let total_ms = millis(now - timing.t_speech_end);
+                    info!(
+                        turn_id,
+                        stt_ms,
+                        llm_ms,
+                        tts_ms = 0,
+                        playback_ms = 0,
+                        total_ms,
+                        "turn latency: speech-end → reply stream end (text mode)"
+                    );
+                    emit(
+                        &events,
+                        AgentEvent::StageLatency {
+                            stt_ms,
+                            llm_ms,
+                            tts_ms: 0,
+                            playback_ms: 0,
+                            total_ms,
+                        },
+                    );
+                }
+            }
+            emit(&events, AgentEvent::ReplyDone);
+            // Ready for the next utterance. Emitted here — after the
+            // turn's whole clause backlog drained through this task — and
+            // not in the orchestrator's stream-done handler, so Listening
+            // can never race ahead of the turn's Clause/ReplyDone events.
+            emit(&events, AgentEvent::Listening);
         }
     }
 }
@@ -847,14 +1027,38 @@ async fn synthesize_clause(
     .await
 }
 
+/// Selftest helper: synthesizes one clause on the blocking pool, appending
+/// the clip + clause text and stamping the first-clause/first-clip marks.
+/// Returns the engine for reuse (a `Box<dyn TtsEngine>` is not `Clone`).
+async fn synth_selftest_clause(
+    engine: Box<dyn TtsEngine>,
+    clause: String,
+    clips: &mut Vec<TtsClip>,
+    clause_texts: &mut Vec<String>,
+    t_first_clause: &mut Option<Instant>,
+    t_first_clip: &mut Option<Instant>,
+) -> Result<Box<dyn TtsEngine>> {
+    t_first_clause.get_or_insert_with(Instant::now);
+    let (engine, result) = synthesize_clause(engine, clause.clone())
+        .await
+        .map_err(|err| anyhow::anyhow!("TTS synthesis panicked: {err}"))?;
+    let clip = result?;
+    t_first_clip.get_or_insert_with(Instant::now);
+    clause_texts.push(clause);
+    clips.push(clip);
+    Ok(engine)
+}
+
 /// First-audible watcher (§8 `t_first_audible`): polls `is_playing` until
 /// the playback callback leaves silence, then logs the one-per-turn latency
-/// summary line. Exits quietly on turn cancel or timeout.
+/// summary line and emits [`AgentEvent::StageLatency`]. Exits quietly on
+/// turn cancel or timeout.
 async fn audible_watcher<C: ClipSink>(
     sink: C,
     token: CancellationToken,
     turn_id: u64,
     timing: TurnTiming,
+    events: broadcast::Sender<AgentEvent>,
 ) {
     let started = Instant::now();
     loop {
@@ -886,6 +1090,16 @@ async fn audible_watcher<C: ClipSink>(
                         total_ms,
                         "turn latency: speech-end → first audible sample"
                     );
+                    emit(
+                        &events,
+                        AgentEvent::StageLatency {
+                            stt_ms,
+                            llm_ms,
+                            tts_ms,
+                            playback_ms,
+                            total_ms,
+                        },
+                    );
                     return;
                 }
                 if started.elapsed() > AUDIBLE_TIMEOUT {
@@ -895,6 +1109,18 @@ async fn audible_watcher<C: ClipSink>(
             }
         }
     }
+}
+
+/// Broadcasts an event, ignoring the "no subscribers" error (a plain
+/// [`Pipeline::new`] run has none).
+fn emit(events: &broadcast::Sender<AgentEvent>, event: AgentEvent) {
+    let _ = events.send(event);
+}
+
+/// Broadcasts an [`AgentEvent::Error`] with the full `anyhow` cause chain
+/// (the first line alone is often too terse to act on).
+fn emit_error(events: &broadcast::Sender<AgentEvent>, err: &SkadooshError) {
+    emit(events, AgentEvent::Error(format!("{err:?}")));
 }
 
 fn millis(d: Duration) -> u64 {
@@ -918,9 +1144,7 @@ struct ActiveTurn {
 /// channel; unwinds in the §6 order. Exposed (hidden) for integration tests
 /// — [`Pipeline::run`] is the production entry point.
 #[doc(hidden)]
-pub async fn run_orchestrator<S: SpeechToText, C: ClipSink>(
-    topology: Topology<S, C>,
-) -> Result<()> {
+pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> {
     let Topology {
         vad_events: mut vad_rx,
         fatal_tx,
@@ -930,6 +1154,7 @@ pub async fn run_orchestrator<S: SpeechToText, C: ClipSink>(
         tts_engine,
         sink,
         shutdown,
+        events,
     } = topology;
 
     let current_turn = Arc::new(AtomicU64::new(0));
@@ -938,44 +1163,29 @@ pub async fn run_orchestrator<S: SpeechToText, C: ClipSink>(
     let (turn_tx, turn_rx) = mpsc::channel(TURN_CAP);
     let (turn_done_tx, mut turn_done_rx) = mpsc::channel(TURN_DONE_CAP);
 
+    let ctx = StageCtx {
+        current_turn,
+        shutdown: shutdown.clone(),
+        fatal_tx: fatal_tx.clone(),
+        // Cloned: the orchestrator itself still emits Listening/TurnCancelled.
+        events: events.clone(),
+    };
     let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(stt_bridge(segment_rx, text_tx, stt, ctx.clone()).instrument(info_span!("stt")));
     tasks.spawn(
-        stt_bridge(
-            segment_rx,
-            text_tx,
-            stt,
-            Arc::clone(&current_turn),
-            shutdown.clone(),
-            fatal_tx.clone(),
-        )
-        .instrument(info_span!("stt")),
+        llm_task(text_rx, turn_tx, turn_done_tx, llm, ctx.clone()).instrument(info_span!("llm")),
     );
     tasks.spawn(
-        llm_task(
-            text_rx,
-            turn_tx,
-            turn_done_tx,
-            llm,
-            Arc::clone(&current_turn),
-            shutdown.clone(),
-            fatal_tx.clone(),
-        )
-        .instrument(info_span!("llm")),
+        tts_task(turn_rx, tts_engine, sink.clone(), ctx.clone()).instrument(info_span!("tts")),
     );
-    tasks.spawn(
-        tts_task(
-            turn_rx,
-            tts_engine,
-            sink.clone(),
-            Arc::clone(&current_turn),
-            shutdown.clone(),
-            fatal_tx.clone(),
-        )
-        .instrument(info_span!("tts")),
-    );
+    // The orchestrator itself dispatches on `ctx.current_turn`.
+    let current_turn = ctx.current_turn;
 
     let mut active_turn: Option<ActiveTurn> = None;
     let mut fatal: Option<SkadooshError> = None;
+
+    // The topology is up; the agent is waiting for speech.
+    emit(&events, AgentEvent::Listening);
 
     loop {
         tokio::select! {
@@ -1007,6 +1217,10 @@ pub async fn run_orchestrator<S: SpeechToText, C: ClipSink>(
                     if let Some(turn) = &mut active_turn {
                         if turn.turn_id == done_id {
                             turn.llm_done = true;
+                            // The turn-end `Listening` event is the TTS
+                            // task's job (after the clause backlog drains
+                            // and ReplyDone fires) — emitting it here would
+                            // race ahead of the turn's events.
                         }
                     }
                 }
@@ -1040,6 +1254,7 @@ pub async fn run_orchestrator<S: SpeechToText, C: ClipSink>(
                                     "barge-in: cancelled turn, flushed playback"
                                 );
                                 turn.token.cancel();
+                                emit(&events, AgentEvent::TurnCancelled);
                             } else {
                                 debug!("barge-in flush with no active LLM turn");
                             }
@@ -1187,12 +1402,12 @@ impl Pipeline {
             "stream": true,
         });
         let t_llm = Instant::now();
-        let resp = http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(LlmError::Http)?;
+        let mut request = http.post(&url).json(&body);
+        if let Some(key) = &self.config.api_key {
+            // Same bearer wiring as LlmClient: keyed providers 401 without it.
+            request = request.bearer_auth(key);
+        }
+        let resp = request.send().await.map_err(LlmError::Http)?;
         let resp = ensure_success(resp).await?;
 
         // Stages 3+4 interleaved: clause-split the token stream and
@@ -1232,15 +1447,15 @@ impl Pipeline {
                     Some(Ok(Some(token))) => {
                         t_first_token.get_or_insert_with(Instant::now);
                         for clause in splitter.push(&token) {
-                            t_first_clause.get_or_insert_with(Instant::now);
-                            let (e, result) = synthesize_clause(engine, clause.clone())
-                                .await
-                                .map_err(|err| anyhow::anyhow!("TTS synthesis panicked: {err}"))?;
-                            engine = e;
-                            let clip = result?;
-                            t_first_clip.get_or_insert_with(Instant::now);
-                            clause_texts.push(clause);
-                            clips.push(clip);
+                            engine = synth_selftest_clause(
+                                engine,
+                                clause,
+                                &mut clips,
+                                &mut clause_texts,
+                                &mut t_first_clause,
+                                &mut t_first_clip,
+                            )
+                            .await?;
                         }
                     }
                     Some(Err(err)) => {
@@ -1250,14 +1465,16 @@ impl Pipeline {
             }
         }
         if let Some(rest) = splitter.flush() {
-            t_first_clause.get_or_insert_with(Instant::now);
-            let (_engine, result) = synthesize_clause(engine, rest.clone())
-                .await
-                .map_err(|err| anyhow::anyhow!("TTS synthesis panicked: {err}"))?;
-            let clip = result?;
-            t_first_clip.get_or_insert_with(Instant::now);
-            clause_texts.push(rest);
-            clips.push(clip);
+            // Stream over: the returned engine is dropped with the report.
+            synth_selftest_clause(
+                engine,
+                rest,
+                &mut clips,
+                &mut clause_texts,
+                &mut t_first_clause,
+                &mut t_first_clip,
+            )
+            .await?;
         }
         if clips.is_empty() {
             return Err(anyhow::anyhow!("LLM reply produced no clauses").into());
@@ -1265,11 +1482,7 @@ impl Pipeline {
         let t_llm_done = Instant::now();
 
         // Stage 5: concatenate clips → 24 kHz 16-bit PCM wav.
-        let total_samples: usize = clips.iter().map(|c| c.samples.len()).sum();
-        let mut pcm = Vec::with_capacity(total_samples);
-        for clip in &clips {
-            pcm.extend_from_slice(&clip.samples);
-        }
+        let pcm = concat_clip_samples(&clips);
         write_wav16(out_wav, &pcm, TTS_SAMPLE_RATE)?;
         let total_ms = millis(t_start.elapsed());
         info!(
@@ -1383,8 +1596,9 @@ fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, rate))
 }
 
-/// Writes a canonical 44-byte-header 16-bit PCM mono wav.
-fn write_wav16(path: &Path, samples: &[f32], rate: u32) -> Result<()> {
+/// Writes a canonical 44-byte-header 16-bit PCM mono wav. Crate-visible:
+/// shared by `--selftest` and `--say --out-wav`.
+pub(crate) fn write_wav16(path: &Path, samples: &[f32], rate: u32) -> Result<()> {
     let data_len = (samples.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + data_len as usize);
     out.extend_from_slice(b"RIFF");
