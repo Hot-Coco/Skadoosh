@@ -4,6 +4,7 @@
 //! lock-free ring buffer; playback pops 24 kHz [`crate::tts::TtsClip`]s and
 //! resamples to the device rate. Real-time callbacks never allocate or lock.
 
+pub mod aec;
 pub mod input;
 pub mod output;
 pub mod resample;

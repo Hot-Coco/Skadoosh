@@ -77,6 +77,7 @@ fn base_config(llm_url: String) -> Config {
         tts_voice: "af".to_string(),
         tts_speed: 1.0,
         wake_word: None,
+        push_to_talk: false,
     }
 }
 

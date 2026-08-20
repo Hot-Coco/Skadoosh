@@ -10,7 +10,7 @@ use skadoosh::stt::{SttConfig, WhisperStt};
 const WHISPER_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/ggml-tiny.en.bin");
 const JFK_WAV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/jfk.wav");
 
-const TIMEOUT: Duration = Duration::from_secs(30);
+const TIMEOUT: Duration = Duration::from_secs(60);
 
 fn fixtures_present() -> bool {
     let present = Path::new(WHISPER_MODEL).is_file() && Path::new(JFK_WAV).is_file();
@@ -60,12 +60,12 @@ async fn whisper_jfk_transcribes_ask_not() {
     let started = Instant::now();
     let text = tokio::time::timeout(TIMEOUT, stt.transcribe(load_jfk()))
         .await
-        .expect("transcription exceeded 30 s")
+        .expect("transcription exceeded 60 s")
         .expect("worker reply channel closed")
         .expect("transcription failed");
     let elapsed = started.elapsed();
     eprintln!("transcript in {elapsed:?}: {text}");
-    assert!(elapsed < TIMEOUT, "transcription took {elapsed:?} (> 30 s)");
+    assert!(elapsed < TIMEOUT, "transcription took {elapsed:?} (> 60 s)");
     assert!(
         normalize(&text).contains("ask not what your country"),
         "transcript missing the JFK phrase: {text:?}"

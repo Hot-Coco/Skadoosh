@@ -243,7 +243,27 @@ with a warm Ollama + Kokoro will differ — that's the point of the table.)
 | `--image <path>` | `SKADOOSH_IMAGE` | — | image path for multimodal turns (repeatable) |
 | `--tools-file <path>` | `SKADOOSH_TOOLS_FILE` | — | JSON tool/function definitions for tool calling |
 | `--max-tool-rounds` | `SKADOOSH_MAX_TOOL_ROUNDS` | `5` | max tool-calling round-trips before forcing text |
+| `--push-to-talk` | `SKADOOSH_PUSH_TO_TALK` | off | keyboard-driven recording (Enter to toggle) |
 | `--selftest <wav>` | `SKADOOSH_SELFTEST` | — | headless end-to-end run |
+
+### GPU execution providers (Cargo features)
+
+Enable exactly one for your platform; ORT falls back to CPU otherwise.
+
+| Feature | Platform | Requires |
+|---|---|---|
+| `gpu-cuda` | NVIDIA GPU | CUDA toolkit |
+| `gpu-coreml` | macOS (Apple Silicon) | — |
+| `gpu-directml` | Windows | Windows SDK |
+| `gpu-rocm` | AMD GPU | ROCm toolkit |
+
+Enable with `cargo build --features gpu-cuda`, etc.
+
+### v0.4.0: new modules
+
+- **Pure-Rust G2P** ([`misaki-rs`](https://crates.io/crates/misaki-rs)) replaces espeak-ng for TTS phonemization — no external binary needed.
+- **Echo cancellation** ([`aec-rs`](https://crates.io/crates/aec-rs)) via `src/audio/aec.rs` for speakerphone-quality barge-in.
+- **Tool executor** ([`tools::ToolExecutor`]) lets tool-calling LLMs run shell commands and feed results back into the conversation.
 
 ## Examples
 

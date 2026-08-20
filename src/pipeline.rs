@@ -331,21 +331,35 @@ fn run_loop<C: ClipSink>(
     runtime.block_on(async move {
         let (vad_tx, vad_rx) = mpsc::channel(VAD_EVENTS_CAP);
         let (fatal_tx, fatal_rx) = mpsc::channel(FATAL_CAP);
-        let vad_join = tokio::spawn(
-            vad_task(VadParts {
-                capture,
-                cons,
-                vad,
-                segmenter,
-                threshold: config.vad_threshold,
-                sink: sink.clone(),
-                events_tx: vad_tx,
-                fatal_tx: fatal_tx.clone(),
-                shutdown: shutdown.clone(),
-                events: events.clone(),
-            })
-            .instrument(info_span!("vad")),
-        );
+        let vad_join: tokio::task::JoinHandle<()> = if config.push_to_talk {
+            tokio::spawn(
+                push_to_talk_task(
+                    capture,
+                    cons,
+                    vad_tx.clone(),
+                    fatal_tx.clone(),
+                    shutdown.clone(),
+                    events.clone(),
+                )
+                .instrument(info_span!("ptt")),
+            )
+        } else {
+            tokio::spawn(
+                vad_task(VadParts {
+                    capture,
+                    cons,
+                    vad,
+                    segmenter,
+                    threshold: config.vad_threshold,
+                    sink: sink.clone(),
+                    events_tx: vad_tx,
+                    fatal_tx: fatal_tx.clone(),
+                    shutdown: shutdown.clone(),
+                    events: events.clone(),
+                })
+                .instrument(info_span!("vad")),
+            )
+        };
         let result = run_orchestrator(Topology {
             vad_events: vad_rx,
             fatal_tx,
@@ -1143,6 +1157,90 @@ fn emit_error(events: &broadcast::Sender<AgentEvent>, err: &SkadooshError) {
 
 fn millis(d: Duration) -> u64 {
     d.as_millis() as u64
+}
+
+/// Push-to-talk recording task: replaces the VAD task when `--push-to-talk`
+/// is set. A keyboard listener on a dedicated OS thread toggles a recording
+/// flag on Enter; the async loop drains the mic ring buffer, accumulates
+/// samples while recording, and emits `Segment` on release.
+async fn push_to_talk_task(
+    capture: MicCapture,
+    mut cons: HeapCons<f32>,
+    vad_tx: mpsc::Sender<VadEventMsg>,
+    _fatal_tx: mpsc::Sender<SkadooshError>,
+    shutdown: CancellationToken,
+    _events: broadcast::Sender<AgentEvent>,
+) {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // MicCapture is already started by the caller; we hold it to keep
+    // the stream alive. Samples arrive via `cons`.
+    let _capture = capture;
+
+    let recording = Arc::new(AtomicBool::new(false));
+    let rec = recording.clone();
+
+    std::thread::spawn(move || {
+        let _raw = crossterm::terminal::enable_raw_mode();
+        loop {
+            if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                        rec.store(!rec.load(Ordering::SeqCst), Ordering::SeqCst);
+                    } else if matches!(key.code, KeyCode::Esc) {
+                        rec.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = crossterm::terminal::disable_raw_mode();
+    });
+
+    let mut turn_id: u64 = 0;
+    let mut accumulating: Vec<f32> = Vec::new();
+    let mut was_recording = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {
+                // Drain the ring buffer.
+                while let Some(s) = cons.try_pop() {
+                    accumulating.push(s);
+                }
+
+                let is_recording = recording.load(Ordering::SeqCst);
+
+                if is_recording && !was_recording {
+                    // Recording just started.
+                    turn_id = turn_id.wrapping_add(1);
+                    accumulating.clear();
+                    let _ = vad_tx.send(VadEventMsg::SpeechStart).await;
+                }
+
+                if !is_recording && was_recording && !accumulating.is_empty() {
+                    // Recording just stopped — send segment.
+                    let samples = std::mem::take(&mut accumulating);
+                    let t_speech_end = Instant::now();
+                    let _ = vad_tx
+                        .send(VadEventMsg::Segment {
+                            samples,
+                            t_speech_end,
+                        })
+                        .await;
+                }
+
+                was_recording = is_recording;
+            }
+        }
+    }
 }
 
 /// Orchestrator-side state for the in-flight turn. The entry survives the

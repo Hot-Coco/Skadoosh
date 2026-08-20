@@ -25,9 +25,11 @@ pub mod agent;
 pub mod audio;
 pub mod config;
 pub mod error;
+pub(crate) mod gpu;
 pub mod llm;
 pub mod pipeline;
 pub mod stt;
+pub mod tools;
 pub mod tts;
 pub mod vad;
 
