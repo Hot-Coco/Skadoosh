@@ -10,7 +10,9 @@ use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub use client::{parse_sse_line, LlmClient, Message};
+pub use client::{
+    parse_sse_line, ContentBlock, ImageUrl, LlmClient, Message, MessageContent,
+};
 pub use splitter::ClauseSplitter;
 
 use crate::error::Result;
