@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use client::{
-    image_to_data_uri, parse_sse_delta, parse_sse_line, ContentBlock, FunctionDef, ImageUrl,
-    LlmClient, Message, MessageContent, SseDelta, Tool, ToolCall,
+    image_to_data_uri, load_tools_file, parse_sse_delta, parse_sse_line, ContentBlock, FunctionDef,
+    ImageUrl, LlmClient, Message, MessageContent, SseDelta, Tool, ToolCall,
 };
 pub use splitter::ClauseSplitter;
 

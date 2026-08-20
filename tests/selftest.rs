@@ -848,6 +848,7 @@ async fn output_text_voice_turn_streams_reply_events() {
                         "StageLatency"
                     }
                     AgentEvent::Error(_) => "Error",
+                    AgentEvent::ToolCall { .. } => "ToolCall",
                 };
                 order.push(kind);
             }

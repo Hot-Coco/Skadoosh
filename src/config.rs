@@ -147,6 +147,15 @@ pub struct Config {
     /// instead of playing it (headless-friendly).
     #[arg(long, env = "SKADOOSH_OUT_WAV", value_name = "PATH")]
     pub out_wav: Option<PathBuf>,
+
+    /// Path to a JSON file of tool/function definitions for tool calling.
+    /// Format: [{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]
+    #[arg(long, env = "SKADOOSH_TOOLS_FILE", value_name = "PATH")]
+    pub tools_file: Option<PathBuf>,
+
+    /// Maximum tool-calling round-trips before forcing a text response (default: 5).
+    #[arg(long, env = "SKADOOSH_MAX_TOOL_ROUNDS", default_value_t = 5)]
+    pub max_tool_rounds: usize,
 }
 
 impl Default for Config {
@@ -175,6 +184,8 @@ impl Default for Config {
             say: None,
             output: OutputMode::Audio,
             out_wav: None,
+            tools_file: None,
+            max_tool_rounds: 5,
         }
     }
 }
@@ -208,6 +219,8 @@ impl fmt::Debug for Config {
             say,
             output,
             out_wav,
+            tools_file,
+            max_tool_rounds,
         } = self;
         f.debug_struct("Config")
             .field("images", images)
@@ -231,6 +244,8 @@ impl fmt::Debug for Config {
             .field("say", say)
             .field("output", output)
             .field("out_wav", out_wav)
+            .field("tools_file", tools_file)
+            .field("max_tool_rounds", max_tool_rounds)
             .finish()
     }
 }

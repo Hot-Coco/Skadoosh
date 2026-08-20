@@ -6,6 +6,7 @@
 //! the last `--max-history-turns` user/assistant turns so long sessions
 //! cannot overflow small local models' context.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use base64::Engine;
@@ -89,6 +90,25 @@ impl From<&str> for MessageContent {
     }
 }
 
+impl From<serde_json::Value> for MessageContent {
+    fn from(v: serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::String(s) => MessageContent::Text(s),
+            serde_json::Value::Array(arr) => {
+                // Try to deserialize as ContentBlock array
+                if let Ok(blocks) = serde_json::from_value::<Vec<ContentBlock>>(
+                    serde_json::Value::Array(arr),
+                ) {
+                    MessageContent::Blocks(blocks)
+                } else {
+                    MessageContent::Text(v.to_string())
+                }
+            }
+            other => MessageContent::Text(other.to_string()),
+        }
+    }
+}
+
 /// Loads an image file and returns a base64 data URI suitable for
 /// multimodal LLM requests. Auto-detects the MIME type from the extension.
 pub fn image_to_data_uri(path: &Path) -> std::result::Result<String, std::io::Error> {
@@ -96,6 +116,16 @@ pub fn image_to_data_uri(path: &Path) -> std::result::Result<String, std::io::Er
     let mime = mime_from_ext(path);
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+/// Loads tool/function definitions from a JSON file.
+/// Format: `[{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]`
+pub fn load_tools_file(path: &Path) -> std::result::Result<Vec<Tool>, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    let tools: Vec<Tool> = serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid tools JSON: {e}"))
+    })?;
+    Ok(tools)
 }
 
 /// Best-effort MIME type from a file extension.
@@ -127,10 +157,17 @@ pub(crate) const CLAUSE_MAX_LEN: usize = 160;
 /// the OpenAI chat-completions schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
-    /// `"system"`, `"user"`, or `"assistant"` (or `"tool"` for tool results).
+    /// `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     pub role: String,
     /// Message content: plain text or multimodal blocks.
     pub content: MessageContent,
+    /// Tool call id (required for `role: "tool"` messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool calls made by the assistant (set on `role: "assistant"` when
+    /// the model requests function calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// A function definition for tool/function calling (OpenAI-compatible).
@@ -298,8 +335,15 @@ impl LlmClient {
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        let tools = if let Some(ref path) = config.tools_file {
+            load_tools_file(path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Self {
             image_paths: config.images.clone(),
+            tools,
+            max_tool_rounds: config.max_tool_rounds,
             ..Self::new(
                 &config.llm_url,
                 &config.llm_model,
@@ -376,87 +420,145 @@ impl LlmClient {
         clauses: &mpsc::Sender<String>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": self.history,
-            "stream": true,
-        });
-        if !self.tools.is_empty() {
-            body["tools"] = serde_json::to_value(&self.tools)
-                .unwrap_or_default();
-        }
-        let url = format!("{}/chat/completions", self.base_url);
+        let tool_count = self.tools.len();
+        let mut total_reply = String::new();
 
-        let mut request = self.http.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let resp = tokio::select! {
-            _ = cancel.cancelled() => return Err(LlmError::Cancelled.into()),
-            r = request.send() => r.map_err(LlmError::Http)?,
-        };
-        let resp = ensure_success(resp).await?;
+        for tool_round in 0..=self.max_tool_rounds {
+            // On the final round, force text by omitting tools.
+            let send_tools = tool_round < self.max_tool_rounds && tool_count > 0;
 
-        let mut stream = resp.bytes_stream();
-        let mut splitter = ClauseSplitter::new(CLAUSE_MIN_LEN, CLAUSE_MAX_LEN);
-        let mut reply = String::new();
-        let mut lines = SseLineBuffer::default();
-        let mut done = false;
-        let mut eof = false;
-
-        while !done && !eof {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => return Err(LlmError::Cancelled.into()),
-                c = stream.next() => c,
-            };
-            match chunk {
-                Some(Ok(bytes)) => lines.feed(&bytes),
-                Some(Err(e)) => return Err(LlmError::Http(e).into()),
-                // Clean connection close (with or without `data: [DONE]`):
-                // closing the buffer makes `next_line` yield any unterminated
-                // final line once, so a server that omits the trailing `\n`
-                // loses no content.
-                None => {
-                    lines.close();
-                    eof = true;
-                }
+            let mut body = serde_json::json!({
+                "model": self.model,
+                "messages": self.history,
+                "stream": true,
+            });
+            if send_tools {
+                body["tools"] = serde_json::to_value(&self.tools).unwrap_or_default();
             }
-            while let Some(line) = lines.next_line() {
-                match parse_sse_line(&line) {
-                    None => {}
-                    Some(Ok(None)) => {
-                        done = true;
-                        break;
-                    }
-                    Some(Ok(Some(token))) => {
-                        reply.push_str(&token);
-                        for clause in splitter.push(&token) {
-                            if !send_clause(clauses, cancel, clause).await? {
-                                // Consumer is gone (pipeline shutdown): stop
-                                // streaming, drop the partial reply.
-                                tracing::debug!("clauses receiver dropped; aborting LLM stream");
-                                return Ok(());
+
+            let url = format!("{}/chat/completions", self.base_url);
+            let mut request = self.http.post(&url).json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            let resp = tokio::select! {
+                _ = cancel.cancelled() => return Err(LlmError::Cancelled.into()),
+                r = request.send() => r.map_err(LlmError::Http)?,
+            };
+            let resp = ensure_success(resp).await?;
+
+            let mut stream = resp.bytes_stream();
+            let mut splitter = ClauseSplitter::new(CLAUSE_MIN_LEN, CLAUSE_MAX_LEN);
+            let mut round_reply = String::new();
+            let mut tool_calls: BTreeMap<usize, ToolCall> = BTreeMap::new();
+            let mut lines = SseLineBuffer::default();
+            let mut done = false;
+            let mut eof = false;
+
+            while !done && !eof {
+                let chunk = tokio::select! {
+                    _ = cancel.cancelled() => return Err(LlmError::Cancelled.into()),
+                    c = stream.next() => c,
+                };
+                match chunk {
+                    Some(Ok(bytes)) => lines.feed(&bytes),
+                    Some(Err(e)) => return Err(LlmError::Http(e).into()),
+                    None => { lines.close(); eof = true; }
+                }
+                while let Some(line) = lines.next_line() {
+                    match parse_sse_delta(&line) {
+                        None => {}
+                        Some(Ok(SseDelta::Done)) => { done = true; break; }
+                        Some(Ok(SseDelta::Text(token))) => {
+                            total_reply.push_str(&token);
+                            round_reply.push_str(&token);
+                            for clause in splitter.push(&token) {
+                                if !send_clause(clauses, cancel, clause).await? {
+                                    tracing::debug!("clauses receiver dropped");
+                                    return Ok(());
+                                }
                             }
                         }
-                    }
-                    Some(Err(e)) => {
-                        tracing::warn!(error = %e, "skipping malformed SSE data line");
+                        Some(Ok(SseDelta::ToolCall(tc))) => {
+                            let idx = 0usize;
+                            let entry = tool_calls.entry(idx).or_insert_with(|| {
+                                ToolCall { id: None, call_type: None, function: None }
+                            });
+                            if tc.id.is_some() { entry.id = tc.id; }
+                            if tc.call_type.is_some() { entry.call_type = tc.call_type; }
+                            if let Some(ref f) = tc.function {
+                                let ef = entry.function.get_or_insert_with(|| {
+                                    ToolCallFunction { name: None, arguments: None }
+                                });
+                                if f.name.is_some() { ef.name = f.name.clone(); }
+                                if let Some(ref args) = f.arguments {
+                                    ef.arguments = Some(
+                                        ef.arguments.take().unwrap_or_default() + args,
+                                    );
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "skipping malformed SSE data line");
+                        }
                     }
                 }
             }
-        }
 
-        // `[DONE]` (or EOF): flush the splitter remainder, then record the
-        // completed assistant reply.
-        if let Some(rest) = splitter.flush() {
-            if !send_clause(clauses, cancel, rest).await? {
-                tracing::debug!("clauses receiver dropped at stream end");
+            // Flush splitter remainder.
+            if let Some(rest) = splitter.flush() {
+                if !send_clause(clauses, cancel, rest).await? {
+                    return Ok(());
+                }
+            }
+
+            // No tool calls → turn complete.
+            if tool_calls.is_empty() {
+                self.history.push(Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Text(round_reply),
+                });
+                self.truncate_history();
                 return Ok(());
             }
+
+            // Tool calls received: record them + add tool results.
+            let calls: Vec<ToolCall> = tool_calls.into_values().collect();
+            tracing::info!(round = tool_round, count = calls.len(), "tool calls received");
+
+            // Assistant message with tool_calls.
+            self.history.push(Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text(String::new()),
+                tool_calls: Some(calls.clone()),
+            });
+
+            // Tool call markers for observability.
+            for tc in &calls {
+                let name = tc.function.as_ref().and_then(|f| f.name.as_deref()).unwrap_or("?");
+                let args = tc.function.as_ref().and_then(|f| f.arguments.as_deref()).unwrap_or("{}");
+                let _ = clauses.send(format!("\x00TOOL:{name}:{args}")).await;
+            }
+
+            // Tool result messages (placeholder — real execution needs
+            // a tool executor injected via the SDK).
+            for tc in &calls {
+                let call_id = tc.id.clone().unwrap_or_else(|| "call_unknown".to_string());
+                self.history.push(Message {
+                    role: "tool".to_string(),
+                    content: MessageContent::Text(
+                        "{\"error\":\"tool execution not configured; respond with text\"}"
+                            .to_string(),
+                    ),
+                    tool_call_id: Some(call_id),
+                });
+            }
         }
+
+        // Max rounds exhausted: record whatever text we got.
         self.history.push(Message {
             role: "assistant".to_string(),
-            content: MessageContent::Text(reply),
+            content: MessageContent::Text(total_reply),
         });
         self.truncate_history();
         Ok(())

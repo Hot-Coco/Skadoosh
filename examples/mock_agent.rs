@@ -205,6 +205,7 @@ async fn main() -> Result<()> {
             AgentEvent::Clause(_) => "Clause",
             AgentEvent::ReplyDone => "ReplyDone",
             AgentEvent::TurnCancelled => "TurnCancelled",
+            AgentEvent::ToolCall { .. } => "ToolCall",
             AgentEvent::StageLatency { .. } => "StageLatency",
             AgentEvent::Error(_) => "Error",
         })
