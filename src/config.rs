@@ -156,6 +156,19 @@ pub struct Config {
     /// Maximum tool-calling round-trips before forcing a text response (default: 5).
     #[arg(long, env = "SKADOOSH_MAX_TOOL_ROUNDS", default_value_t = 5)]
     pub max_tool_rounds: usize,
+
+    /// Kokoro TTS voice key (e.g. "af", "am_adam"). Requires Kokoro model.
+    #[arg(long, env = "SKADOOSH_TTS_VOICE", default_value = "af")]
+    pub tts_voice: String,
+
+    /// TTS playback speed multiplier (0.5 – 2.0, default: 1.0).
+    #[arg(long, env = "SKADOOSH_TTS_SPEED", default_value_t = 1.0)]
+    pub tts_speed: f32,
+
+    /// Wake word to trigger listening (e.g. "hey skadoosh"). When set, the agent
+    /// only processes speech after the wake word is detected in the transcript.
+    #[arg(long, env = "SKADOOSH_WAKE_WORD")]
+    pub wake_word: Option<String>,
 }
 
 impl Default for Config {
@@ -186,6 +199,9 @@ impl Default for Config {
             out_wav: None,
             tools_file: None,
             max_tool_rounds: 5,
+            tts_voice: "af".to_string(),
+            tts_speed: 1.0,
+            wake_word: None,
         }
     }
 }
@@ -221,6 +237,9 @@ impl fmt::Debug for Config {
             out_wav,
             tools_file,
             max_tool_rounds,
+            tts_voice,
+            tts_speed,
+            wake_word,
         } = self;
         f.debug_struct("Config")
             .field("images", images)
@@ -246,6 +265,9 @@ impl fmt::Debug for Config {
             .field("out_wav", out_wav)
             .field("tools_file", tools_file)
             .field("max_tool_rounds", max_tool_rounds)
+            .field("tts_voice", tts_voice)
+            .field("tts_speed", tts_speed)
+            .field("wake_word", wake_word)
             .finish()
     }
 }

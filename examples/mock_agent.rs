@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
         sink: sink.clone(),
         shutdown: shutdown.clone(),
         events,
+        wake_word: None,
     }));
 
     // One scripted voice turn: a one-second "segment" (contents are ignored

@@ -51,6 +51,7 @@ fn fixtures_present() -> bool {
 
 fn base_config(llm_url: String) -> Config {
     Config {
+        images: Vec::new(),
         llm_url,
         llm_model: "mock-model".to_string(),
         api_key: None,
@@ -71,6 +72,11 @@ fn base_config(llm_url: String) -> Config {
         say: None,
         output: OutputMode::Audio,
         out_wav: None,
+        tools_file: None,
+        max_tool_rounds: 5,
+        tts_voice: "af".to_string(),
+        tts_speed: 1.0,
+        wake_word: None,
     }
 }
 
@@ -180,6 +186,7 @@ fn spawn_orchestrator_full(
         sink,
         shutdown: shutdown.clone(),
         events,
+        wake_word: None,
     }));
     Harness {
         vad_tx,
@@ -765,6 +772,7 @@ async fn output_text_voice_turn_streams_reply_events() {
                 sink,
                 shutdown: shutdown.clone(),
                 events: events_tx,
+                wake_word: None,
             }));
 
             // Feed jfk.wav through the real VAD, like the VAD task would.

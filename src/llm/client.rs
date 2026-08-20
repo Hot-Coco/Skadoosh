@@ -94,11 +94,10 @@ impl From<serde_json::Value> for MessageContent {
     fn from(v: serde_json::Value) -> Self {
         match v {
             serde_json::Value::String(s) => MessageContent::Text(s),
-            serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(ref arr) => {
                 // Try to deserialize as ContentBlock array
-                if let Ok(blocks) = serde_json::from_value::<Vec<ContentBlock>>(
-                    serde_json::Value::Array(arr),
-                ) {
+                let val = serde_json::Value::Array(arr.clone());
+                if let Ok(blocks) = serde_json::from_value::<Vec<ContentBlock>>(val) {
                     MessageContent::Blocks(blocks)
                 } else {
                     MessageContent::Text(v.to_string())
@@ -123,7 +122,10 @@ pub fn image_to_data_uri(path: &Path) -> std::result::Result<String, std::io::Er
 pub fn load_tools_file(path: &Path) -> std::result::Result<Vec<Tool>, std::io::Error> {
     let bytes = std::fs::read(path)?;
     let tools: Vec<Tool> = serde_json::from_slice(&bytes).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid tools JSON: {e}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid tools JSON: {e}"),
+        )
     })?;
     Ok(tools)
 }
@@ -220,6 +222,9 @@ pub struct ToolCallFunction {
 /// One tool call from a model response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// Tool call index in the response (distinguishes parallel calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<u64>,
     /// Unique call id (set in the first delta chunk).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -290,6 +295,8 @@ impl LlmClient {
             history: vec![Message {
                 role: "system".to_string(),
                 content: MessageContent::Text(system_prompt.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
             }],
             image_paths: Vec::new(),
             tools: Vec::new(),
@@ -404,6 +411,8 @@ impl LlmClient {
         self.history.push(Message {
             role: "user".to_string(),
             content: user_content,
+            tool_call_id: None,
+            tool_calls: None,
         });
         let result = self.stream_reply_inner(&clauses, &cancel).await;
         if matches!(result, Err(SkadooshError::Llm(LlmError::Cancelled))) {
@@ -463,12 +472,18 @@ impl LlmClient {
                 match chunk {
                     Some(Ok(bytes)) => lines.feed(&bytes),
                     Some(Err(e)) => return Err(LlmError::Http(e).into()),
-                    None => { lines.close(); eof = true; }
+                    None => {
+                        lines.close();
+                        eof = true;
+                    }
                 }
                 while let Some(line) = lines.next_line() {
                     match parse_sse_delta(&line) {
                         None => {}
-                        Some(Ok(SseDelta::Done)) => { done = true; break; }
+                        Some(Ok(SseDelta::Done)) => {
+                            done = true;
+                            break;
+                        }
                         Some(Ok(SseDelta::Text(token))) => {
                             total_reply.push_str(&token);
                             round_reply.push_str(&token);
@@ -480,21 +495,33 @@ impl LlmClient {
                             }
                         }
                         Some(Ok(SseDelta::ToolCall(tc))) => {
-                            let idx = 0usize;
-                            let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                ToolCall { id: None, call_type: None, function: None }
+                            let idx = tc.index.unwrap_or(0) as usize;
+                            let entry = tool_calls.entry(idx).or_insert_with(|| ToolCall {
+                                index: None,
+                                id: None,
+                                call_type: None,
+                                function: None,
                             });
-                            if tc.id.is_some() { entry.id = tc.id; }
-                            if tc.call_type.is_some() { entry.call_type = tc.call_type; }
+                            if tc.index.is_some() {
+                                entry.index = tc.index;
+                            }
+                            if tc.id.is_some() {
+                                entry.id = tc.id;
+                            }
+                            if tc.call_type.is_some() {
+                                entry.call_type = tc.call_type;
+                            }
                             if let Some(ref f) = tc.function {
-                                let ef = entry.function.get_or_insert_with(|| {
-                                    ToolCallFunction { name: None, arguments: None }
+                                let ef = entry.function.get_or_insert(ToolCallFunction {
+                                    name: None,
+                                    arguments: None,
                                 });
-                                if f.name.is_some() { ef.name = f.name.clone(); }
+                                if f.name.is_some() {
+                                    ef.name = f.name.clone();
+                                }
                                 if let Some(ref args) = f.arguments {
-                                    ef.arguments = Some(
-                                        ef.arguments.take().unwrap_or_default() + args,
-                                    );
+                                    ef.arguments =
+                                        Some(ef.arguments.take().unwrap_or_default() + args);
                                 }
                             }
                         }
@@ -517,6 +544,8 @@ impl LlmClient {
                 self.history.push(Message {
                     role: "assistant".to_string(),
                     content: MessageContent::Text(round_reply),
+                    tool_call_id: None,
+                    tool_calls: None,
                 });
                 self.truncate_history();
                 return Ok(());
@@ -524,19 +553,32 @@ impl LlmClient {
 
             // Tool calls received: record them + add tool results.
             let calls: Vec<ToolCall> = tool_calls.into_values().collect();
-            tracing::info!(round = tool_round, count = calls.len(), "tool calls received");
+            tracing::info!(
+                round = tool_round,
+                count = calls.len(),
+                "tool calls received"
+            );
 
             // Assistant message with tool_calls.
             self.history.push(Message {
                 role: "assistant".to_string(),
                 content: MessageContent::Text(String::new()),
+                tool_call_id: None,
                 tool_calls: Some(calls.clone()),
             });
 
             // Tool call markers for observability.
             for tc in &calls {
-                let name = tc.function.as_ref().and_then(|f| f.name.as_deref()).unwrap_or("?");
-                let args = tc.function.as_ref().and_then(|f| f.arguments.as_deref()).unwrap_or("{}");
+                let name = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.name.as_deref())
+                    .unwrap_or("?");
+                let args = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.arguments.as_deref())
+                    .unwrap_or("{}");
                 let _ = clauses.send(format!("\x00TOOL:{name}:{args}")).await;
             }
 
@@ -551,6 +593,7 @@ impl LlmClient {
                             .to_string(),
                     ),
                     tool_call_id: Some(call_id),
+                    tool_calls: None,
                 });
             }
         }
@@ -559,6 +602,8 @@ impl LlmClient {
         self.history.push(Message {
             role: "assistant".to_string(),
             content: MessageContent::Text(total_reply),
+            tool_call_id: None,
+            tool_calls: None,
         });
         self.truncate_history();
         Ok(())
@@ -576,6 +621,8 @@ impl LlmClient {
         self.history.push(Message {
             role: "system".to_string(),
             content: MessageContent::Text(self.system_prompt.clone()),
+            tool_call_id: None,
+            tool_calls: None,
         });
     }
 

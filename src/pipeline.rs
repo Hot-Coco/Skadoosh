@@ -356,6 +356,7 @@ fn run_loop<C: ClipSink>(
             sink,
             shutdown,
             events,
+            wake_word: config.wake_word.clone(),
         })
         .await;
         // The orchestrator cancelled the shutdown token on its way out,
@@ -468,6 +469,9 @@ pub struct Topology<C: ClipSink> {
     pub shutdown: CancellationToken,
     /// Agent-event broadcast; every stage reports through it.
     pub events: broadcast::Sender<AgentEvent>,
+    /// Optional wake word: when set, the LLM task silently drops
+    /// transcripts that do not contain this word.
+    pub wake_word: Option<String>,
 }
 
 /// A segment forwarded by the orchestrator to the STT bridge.
@@ -651,6 +655,9 @@ struct StageCtx {
     fatal_tx: mpsc::Sender<SkadooshError>,
     /// Agent-event broadcast.
     events: broadcast::Sender<AgentEvent>,
+    /// Optional wake word: transcripts that do NOT contain this word
+    /// are silently dropped before reaching the LLM.
+    wake_word: Option<String>,
 }
 
 /// STT bridge (§7 task 4): segment → `transcribe` oneshot await → text
@@ -668,6 +675,7 @@ async fn stt_bridge(
         shutdown,
         fatal_tx,
         events,
+        ..
     } = ctx;
     loop {
         let msg = tokio::select! {
@@ -771,6 +779,7 @@ async fn llm_task(
         shutdown,
         fatal_tx,
         events,
+        wake_word,
     } = ctx;
     loop {
         let msg = tokio::select! {
@@ -791,6 +800,14 @@ async fn llm_task(
         if token.is_cancelled() || turn_id != current_turn.load(Ordering::SeqCst) {
             debug!(turn_id, "dropping stale transcript before LLM request");
             continue;
+        }
+        // Wake word gating: when set, discard transcripts that do not
+        // contain the wake word (case-insensitive substring match).
+        if let Some(ref ww) = wake_word {
+            if !text.to_lowercase().contains(&ww.to_lowercase()) {
+                debug!(turn_id, %text, wake_word = %ww, "transcript missing wake word; skipping turn");
+                continue;
+            }
         }
         let (clause_tx, clause_rx) = mpsc::channel(CLAUSE_CAP);
         let turn = TurnMsg {
@@ -861,6 +878,7 @@ async fn tts_task<C: ClipSink>(
         shutdown,
         fatal_tx,
         events,
+        ..
     } = ctx;
     'outer: loop {
         let turn = tokio::select! {
@@ -1155,6 +1173,7 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
         sink,
         shutdown,
         events,
+        wake_word,
     } = topology;
 
     let current_turn = Arc::new(AtomicU64::new(0));
@@ -1169,6 +1188,7 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
         fatal_tx: fatal_tx.clone(),
         // Cloned: the orchestrator itself still emits Listening/TurnCancelled.
         events: events.clone(),
+        wake_word,
     };
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(stt_bridge(segment_rx, text_tx, stt, ctx.clone()).instrument(info_span!("stt")));
