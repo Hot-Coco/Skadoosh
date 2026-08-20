@@ -133,6 +133,79 @@ pub struct Message {
     pub content: MessageContent,
 }
 
+/// A function definition for tool/function calling (OpenAI-compatible).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    /// Function name.
+    pub name: String,
+    /// Human-readable description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for the function's parameters.
+    pub parameters: serde_json::Value,
+}
+
+/// A tool available to the model for function calling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    /// Must be `"function"` for OpenAI-compatible APIs.
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    /// The function definition.
+    pub function: FunctionDef,
+}
+
+impl Tool {
+    /// Creates a new function-type tool.
+    pub fn function(name: &str, description: &str, parameters: serde_json::Value) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: name.to_string(),
+                description: Some(description.to_string()),
+                parameters,
+            },
+        }
+    }
+}
+
+/// A function call extracted from a tool-call delta.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    /// Function name (set in the first delta chunk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Partial or complete JSON arguments string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+/// One tool call from a model response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Unique call id (set in the first delta chunk).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Must be `"function"`.
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    /// The function name + arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<ToolCallFunction>,
+}
+
+/// A delta from one SSE chunk: either a text token or a tool call fragment.
+#[derive(Debug, Clone)]
+pub enum SseDelta {
+    /// A plain text content token.
+    Text(String),
+    /// A tool call fragment (accumulated across chunks by index).
+    ToolCall(ToolCall),
+    /// End of stream sentinel (`data: [DONE]`).
+    Done,
+}
+
 /// Streaming LLM client for an OpenAI-compatible `/chat/completions` API.
 ///
 /// Implements [`LlmBackend`](crate::llm::LlmBackend). Supports multimodal
@@ -149,6 +222,10 @@ pub struct LlmClient {
     history: Vec<Message>,
     /// Image paths for the next user turn (cleared after the turn).
     image_paths: Vec<std::path::PathBuf>,
+    /// Tool/function definitions sent with each request.
+    tools: Vec<Tool>,
+    /// Maximum tool-calling round-trips before forcing a text response.
+    max_tool_rounds: usize,
 }
 
 impl LlmClient {
@@ -178,6 +255,8 @@ impl LlmClient {
                 content: MessageContent::Text(system_prompt.to_string()),
             }],
             image_paths: Vec::new(),
+            tools: Vec::new(),
+            max_tool_rounds: 5,
         }
     }
 
@@ -198,6 +277,22 @@ impl LlmClient {
     /// Clears any queued image paths.
     pub fn clear_images(&mut self) {
         self.image_paths.clear();
+    }
+
+    /// Sets the tool/function definitions sent with every request.
+    /// Tools are registered once and included in every turn; use an
+    /// empty vec to disable tool calling.
+    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Sets the maximum number of tool-calling round-trips (default: 5).
+    /// The tool loop terminates early when the model returns a text
+    /// response instead of tool calls, or when this limit is reached.
+    pub fn with_max_tool_rounds(mut self, max: usize) -> Self {
+        self.max_tool_rounds = max;
+        self
     }
 
     /// Builds the config-default client (the one shared construction used
@@ -278,11 +373,15 @@ impl LlmClient {
         clauses: &mpsc::Sender<String>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": self.history,
             "stream": true,
         });
+        if !self.tools.is_empty() {
+            body["tools"] = serde_json::to_value(&self.tools)
+                .unwrap_or_default();
+        }
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut request = self.http.post(&url).json(&body);
@@ -467,7 +566,21 @@ impl SseLineBuffer {
 /// * `data: [DONE]` → `Some(Ok(None))` (end sentinel);
 /// * `data: {...}` with content → `Some(Ok(Some(token)))`;
 /// * malformed JSON → `Some(Err(..))`; the caller warns and skips the line.
+///
+/// For tool-calling support, use [`parse_sse_delta`] instead.
 pub fn parse_sse_line(line: &str) -> Option<Result<Option<String>>> {
+    match parse_sse_delta(line)? {
+        Ok(SseDelta::Text(t)) => Some(Ok(Some(t))),
+        Ok(SseDelta::Done) => Some(Ok(None)),
+        Ok(SseDelta::ToolCall(_)) => None, // no text, no tool handling in legacy path
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Parses one SSE line into an [`SseDelta`] — text content token, tool
+/// call fragment, or the `[DONE]` sentinel. Handles both text deltas
+/// (`delta.content`) and tool-call deltas (`delta.tool_calls[]`).
+pub fn parse_sse_delta(line: &str) -> Option<Result<SseDelta>> {
     let line = line.trim();
     if line.is_empty() || line.starts_with(':') {
         return None;
@@ -475,7 +588,7 @@ pub fn parse_sse_line(line: &str) -> Option<Result<Option<String>>> {
     let data = line.strip_prefix("data:")?;
     let data = data.trim();
     if data == "[DONE]" {
-        return Some(Ok(None));
+        return Some(Ok(SseDelta::Done));
     }
     let parsed: serde_json::Value = match serde_json::from_str(data) {
         Ok(v) => v,
@@ -483,19 +596,25 @@ pub fn parse_sse_line(line: &str) -> Option<Result<Option<String>>> {
             return Some(Err(LlmError::Sse(format!("malformed SSE data: {e}")).into()));
         }
     };
-    // OpenAI `chat.completion.chunk`: `choices[0].delta.content`. Chunks
-    // without content (role-only deltas, `finish_reason` markers, usage
-    // summaries) are ignored.
-    let token = parsed
-        .get("choices")?
-        .as_array()?
-        .first()?
-        .get("delta")?
-        .get("content")?
-        .as_str()?;
+    let choices = parsed.get("choices")?.as_array()?;
+    let choice = choices.first()?;
+    let delta = choice.get("delta")?;
+
+    // Tool calls take priority: if `delta.tool_calls` is present, parse them.
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(tc) = tool_calls.first() {
+            if let Ok(tool_call) = serde_json::from_value::<ToolCall>(tc.clone()) {
+                return Some(Ok(SseDelta::ToolCall(tool_call)));
+            }
+        }
+        return None;
+    }
+
+    // Plain text content.
+    let token = delta.get("content")?.as_str()?;
     if token.is_empty() {
         None
     } else {
-        Some(Ok(Some(token.to_string())))
+        Some(Ok(SseDelta::Text(token.to_string())))
     }
 }
