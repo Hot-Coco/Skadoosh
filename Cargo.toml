@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -78,3 +78,65 @@ codegen-units = 1
 no-default-features = true
 features = ["load-dynamic"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+# Cookbook examples — standalone .rs files in cookbooks/ (a non-standard
+# directory), so each one needs an explicit [[example]] entry with its path.
+[[example]]
+name = "01_hello_tts"
+path = "cookbooks/01_hello_tts.rs"
+
+[[example]]
+name = "02_text_turn"
+path = "cookbooks/02_text_turn.rs"
+
+[[example]]
+name = "03_repl_mode"
+path = "cookbooks/03_repl_mode.rs"
+
+[[example]]
+name = "04_multimodal"
+path = "cookbooks/04_multimodal.rs"
+
+[[example]]
+name = "05_tool_defs"
+path = "cookbooks/05_tool_defs.rs"
+
+[[example]]
+name = "06_tool_executor"
+path = "cookbooks/06_tool_executor.rs"
+
+[[example]]
+name = "07_events"
+path = "cookbooks/07_events.rs"
+
+[[example]]
+name = "08_clause_stream"
+path = "cookbooks/08_clause_stream.rs"
+
+[[example]]
+name = "09_history"
+path = "cookbooks/09_history.rs"
+
+[[example]]
+name = "10_config_modes"
+path = "cookbooks/10_config_modes.rs"
+
+[[example]]
+name = "11_barge_in"
+path = "cookbooks/11_barge_in.rs"
+
+[[example]]
+name = "12_mock_pipeline"
+path = "cookbooks/12_mock_pipeline.rs"
+
+[[example]]
+name = "13_image_encoding"
+path = "cookbooks/13_image_encoding.rs"
+
+[[example]]
+name = "14_wake_word"
+path = "cookbooks/14_wake_word.rs"
+
+[[example]]
+name = "15_push_to_talk"
+path = "cookbooks/15_push_to_talk.rs"
