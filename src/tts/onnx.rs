@@ -52,6 +52,7 @@ impl OnnxTts {
     /// they yield [`TtsError::MissingVoices`].
     pub fn load(model: &Path, voices: &Path, voice: &str, speed: f32) -> Result<Self> {
         let mut builder = Session::builder().map_err(|e| TtsError::ModelLoad(e.to_string()))?;
+        crate::gpu::apply_gpu_ep(&mut builder);
         let session = builder
             .commit_from_file(model)
             .map_err(|e| TtsError::ModelLoad(format!("{}: {e}", model.display())))?;

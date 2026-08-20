@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -27,6 +27,16 @@ default = ["download-binaries"]
 ## runtime instead (what docs.rs uses, since its sandbox has no network).
 download-binaries = ["ort/download-binaries", "ort/tls-rustls", "ort/copy-dylibs"]
 load-dynamic = ["ort/load-dynamic"]
+## GPU execution-provider feature flags. Enable exactly one for your platform.
+## None enabled by default — ONNX Runtime falls back to CPU.
+## * `gpu-cuda` — NVIDIA CUDA (requires CUDA toolkit at build time).
+## * `gpu-coreml` — Apple CoreML (macOS only).
+## * `gpu-directml` — DirectML on Windows (requires Windows SDK).
+## * `gpu-rocm` — AMD ROCm (requires ROCm toolkit at build time).
+gpu-cuda = []
+gpu-coreml = []
+gpu-directml = []
+gpu-rocm = []
 
 [dependencies]
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-27"] }
@@ -45,6 +55,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "=4", features = ["derive", "env"] }
 base64 = "=0.22"
+aec-rs = "=1"
+misaki-rs = "0.3"
+crossterm = "=0.28"
 
 [dev-dependencies]
 hound = "=3"

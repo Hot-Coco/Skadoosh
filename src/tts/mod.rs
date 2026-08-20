@@ -1,6 +1,7 @@
 //! TTS engine trait, clip type, and the engine factory (Kokoro ONNX with a
 //! sine-wave mock fallback).
 
+pub mod misaki_g2p;
 pub mod mock;
 pub mod onnx;
 pub mod phonemes;

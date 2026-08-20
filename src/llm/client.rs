@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{LlmError, Result, SkadooshError};
 use crate::llm::splitter::ClauseSplitter;
+use crate::tools::{ShellExecutor, ToolExecutor};
 
 /// One content block in a multimodal message (OpenAI-compatible format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +269,10 @@ pub struct LlmClient {
     tools: Vec<Tool>,
     /// Maximum tool-calling round-trips before forcing a text response.
     max_tool_rounds: usize,
+    /// Optional tool executor for running the function calls the model
+    /// requests. When `None`, tool calls get a placeholder "not configured"
+    /// result message.
+    tool_executor: Option<Box<dyn ToolExecutor>>,
 }
 
 impl LlmClient {
@@ -301,6 +306,7 @@ impl LlmClient {
             image_paths: Vec::new(),
             tools: Vec::new(),
             max_tool_rounds: 5,
+            tool_executor: None,
         }
     }
 
@@ -339,6 +345,16 @@ impl LlmClient {
         self
     }
 
+    /// Sets the tool executor used to run the function calls the model
+    /// requests during tool calling (see [`ToolExecutor`]). When none is
+    /// configured, tool calls fall back to a placeholder "not configured"
+    /// result message. [`from_config`](Self::from_config) wires in a
+    /// [`ShellExecutor`] automatically when `tools_file` is set.
+    pub fn with_tool_executor(mut self, executor: Box<dyn ToolExecutor>) -> Self {
+        self.tool_executor = Some(executor);
+        self
+    }
+
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
@@ -347,10 +363,19 @@ impl LlmClient {
         } else {
             Vec::new()
         };
+        // When tool definitions are configured, wire in a ShellExecutor so the
+        // model's function calls actually run instead of returning a
+        // placeholder result.
+        let tool_executor: Option<Box<dyn ToolExecutor>> = if config.tools_file.is_some() {
+            Some(Box::new(ShellExecutor::new()))
+        } else {
+            None
+        };
         Self {
             image_paths: config.images.clone(),
             tools,
             max_tool_rounds: config.max_tool_rounds,
+            tool_executor,
             ..Self::new(
                 &config.llm_url,
                 &config.llm_model,
@@ -582,16 +607,39 @@ impl LlmClient {
                 let _ = clauses.send(format!("\x00TOOL:{name}:{args}")).await;
             }
 
-            // Tool result messages (placeholder — real execution needs
-            // a tool executor injected via the SDK).
+            // Tool result messages: run each call via the configured executor,
+            // or fall back to a placeholder when none is configured.
             for tc in &calls {
                 let call_id = tc.id.clone().unwrap_or_else(|| "call_unknown".to_string());
+                let name = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.name.as_deref())
+                    .unwrap_or("");
+                let args = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.arguments.as_deref())
+                    .unwrap_or("{}");
+                let content = match self.tool_executor.as_ref() {
+                    Some(executor) => match executor.execute(name, args) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            tracing::warn!(tool = %name, error = %e, "tool execution failed");
+                            // serde_json::to_string yields a properly-escaped
+                            // JSON string literal, so the error body stays
+                            // valid JSON even with quotes/newlines.
+                            let body = serde_json::to_string(&e.to_string())
+                                .unwrap_or_else(|_| "\"<unprintable error>\"".to_string());
+                            format!("{{\"error\":{body}}}")
+                        }
+                    },
+                    None => "{\"error\":\"tool execution not configured; respond with text\"}"
+                        .to_string(),
+                };
                 self.history.push(Message {
                     role: "tool".to_string(),
-                    content: MessageContent::Text(
-                        "{\"error\":\"tool execution not configured; respond with text\"}"
-                            .to_string(),
-                    ),
+                    content: MessageContent::Text(content),
                     tool_call_id: Some(call_id),
                     tool_calls: None,
                 });

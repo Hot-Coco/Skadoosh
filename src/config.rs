@@ -169,6 +169,11 @@ pub struct Config {
     /// only processes speech after the wake word is detected in the transcript.
     #[arg(long, env = "SKADOOSH_WAKE_WORD")]
     pub wake_word: Option<String>,
+
+    /// Push-to-talk mode: press and hold Enter to record, release to send.
+    /// Overrides VAD-based segmentation when enabled.
+    #[arg(long, env = "SKADOOSH_PUSH_TO_TALK", default_value_t = false)]
+    pub push_to_talk: bool,
 }
 
 impl Default for Config {
@@ -202,6 +207,7 @@ impl Default for Config {
             tts_voice: "af".to_string(),
             tts_speed: 1.0,
             wake_word: None,
+            push_to_talk: false,
         }
     }
 }
@@ -240,6 +246,7 @@ impl fmt::Debug for Config {
             tts_voice,
             tts_speed,
             wake_word,
+            push_to_talk,
         } = self;
         f.debug_struct("Config")
             .field("images", images)
@@ -268,6 +275,7 @@ impl fmt::Debug for Config {
             .field("tts_voice", tts_voice)
             .field("tts_speed", tts_speed)
             .field("wake_word", wake_word)
+            .field("push_to_talk", push_to_talk)
             .finish()
     }
 }
