@@ -298,13 +298,16 @@ impl LlmClient {
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
-        Self::new(
-            &config.llm_url,
-            &config.llm_model,
-            &config.system_prompt,
-            config.max_history_turns,
-            config.api_key.clone(),
-        )
+        Self {
+            image_paths: config.images.clone(),
+            ..Self::new(
+                &config.llm_url,
+                &config.llm_model,
+                &config.system_prompt,
+                config.max_history_turns,
+                config.api_key.clone(),
+            )
+        }
     }
 
     /// Streams a reply: appends the user message, POSTs

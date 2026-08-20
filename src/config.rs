@@ -40,6 +40,12 @@ pub enum OutputMode {
                   with barge-in."
 )]
 pub struct Config {
+    /// Image file paths to include with the next user turn (multimodal
+    /// vision models). Accepts PNG, JPEG, GIF, WebP, BMP, TIFF, and PDF.
+    /// Repeat for multiple images: `--image a.png --image b.jpg`.
+    #[arg(long = "image", env = "SKADOOSH_IMAGE", value_name = "PATH")]
+    pub images: Vec<PathBuf>,
+
     /// Base URL of the OpenAI-compatible LLM API.
     #[arg(
         long,
@@ -148,6 +154,7 @@ impl Default for Config {
     /// `Config::default()` equals bare `skadoosh` with no flags).
     fn default() -> Self {
         Self {
+            images: Vec::new(),
             llm_url: "http://localhost:11434/v1".to_string(),
             llm_model: "qwen2.5:0.5b".to_string(),
             api_key: None,
@@ -180,6 +187,7 @@ impl fmt::Debug for Config {
     /// considered here (and redacted too if ever secret).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            images,
             llm_url,
             llm_model,
             api_key,
@@ -202,6 +210,7 @@ impl fmt::Debug for Config {
             out_wav,
         } = self;
         f.debug_struct("Config")
+            .field("images", images)
             .field("llm_url", llm_url)
             .field("llm_model", llm_model)
             .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
