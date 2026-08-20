@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
