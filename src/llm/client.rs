@@ -348,7 +348,7 @@ impl LlmClient {
     /// Sets the tool executor used to run the function calls the model
     /// requests during tool calling (see [`ToolExecutor`]). When none is
     /// configured, tool calls fall back to a placeholder "not configured"
-    /// result message. [`from_config`](Self::from_config) wires in a
+    /// result message. `LlmClient::from_config` wires in a
     /// [`ShellExecutor`] automatically when `tools_file` is set.
     pub fn with_tool_executor(mut self, executor: Box<dyn ToolExecutor>) -> Self {
         self.tool_executor = Some(executor);
