@@ -90,6 +90,16 @@ pub enum AgentEvent {
     /// One reply clause completed out of the LLM stream (TTS input in
     /// audio mode; the printed unit in text mode and the repl).
     Clause(String),
+    /// A tool/function call was requested by the model (tool-calling
+    /// support). The caller should execute the function and feed the
+    /// result back — without an executor, the LLM is told to respond with
+    /// text instead.
+    ToolCall {
+        /// Tool/function name.
+        name: String,
+        /// JSON arguments string.
+        arguments: String,
+    },
     /// The LLM reply stream for the current turn completed; every
     /// [`Clause`](AgentEvent::Clause) of the turn precedes it, and
     /// [`Listening`](AgentEvent::Listening) follows it immediately.

@@ -237,6 +237,12 @@ with a warm Ollama + Kokoro will differ — that's the point of the table.)
 | `--input-device` / `--output-device` | `SKADOOSH_INPUT_DEVICE` / `SKADOOSH_OUTPUT_DEVICE` | default | device names |
 | `--list-devices` | — | — | enumerate devices and exit |
 | `--mock-tts` | `SKADOOSH_MOCK_TTS` | off | force the sine-wave TTS |
+| `--tts-voice` | `SKADOOSH_TTS_VOICE` | `af` | Kokoro voice key (e.g. `af`, `am_adam`) |
+| `--tts-speed` | `SKADOOSH_TTS_SPEED` | `1.0` | TTS playback speed (0.5–2.0) |
+| `--wake-word` | `SKADOOSH_WAKE_WORD` | — | only process speech containing this word |
+| `--image <path>` | `SKADOOSH_IMAGE` | — | image path for multimodal turns (repeatable) |
+| `--tools-file <path>` | `SKADOOSH_TOOLS_FILE` | — | JSON tool/function definitions for tool calling |
+| `--max-tool-rounds` | `SKADOOSH_MAX_TOOL_ROUNDS` | `5` | max tool-calling round-trips before forcing text |
 | `--selftest <wav>` | `SKADOOSH_SELFTEST` | — | headless end-to-end run |
 
 ## Examples

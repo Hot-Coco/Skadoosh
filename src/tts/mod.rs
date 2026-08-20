@@ -14,12 +14,6 @@ use crate::error::Result;
 /// Sample rate emitted by every TTS engine (Kokoro and the mock agree).
 pub const TTS_SAMPLE_RATE: u32 = 24_000;
 
-/// Default Kokoro voice (`af`, the "af" heart voice) and speed; v1 has no
-/// CLI flags for these (plan §4 config surface).
-const DEFAULT_VOICE: &str = "af";
-/// Default speaking-rate multiplier for [`OnnxTts`].
-const DEFAULT_SPEED: f32 = 1.0;
-
 /// A synthesized audio clip.
 #[derive(Debug, Clone)]
 pub struct TtsClip {
@@ -59,7 +53,7 @@ pub fn build_engine(cfg: &Config) -> Result<Box<dyn TtsEngine>> {
     if !cfg.mock_tts {
         match (&cfg.tts_model, &cfg.tts_voices) {
             (Some(model), Some(voices)) if model.exists() && voices.exists() => {
-                match OnnxTts::load(model, voices, DEFAULT_VOICE, DEFAULT_SPEED) {
+                match OnnxTts::load(model, voices, &cfg.tts_voice, cfg.tts_speed) {
                     Ok(engine) => return Ok(Box::new(engine)),
                     Err(e) => {
                         tracing::warn!(

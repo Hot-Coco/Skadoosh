@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
         sink: sink.clone(),
         shutdown: shutdown.clone(),
         events,
+        wake_word: None,
     }));
 
     // One scripted voice turn: a one-second "segment" (contents are ignored
@@ -205,6 +206,7 @@ async fn main() -> Result<()> {
             AgentEvent::Clause(_) => "Clause",
             AgentEvent::ReplyDone => "ReplyDone",
             AgentEvent::TurnCancelled => "TurnCancelled",
+            AgentEvent::ToolCall { .. } => "ToolCall",
             AgentEvent::StageLatency { .. } => "StageLatency",
             AgentEvent::Error(_) => "Error",
         })

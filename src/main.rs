@@ -142,6 +142,11 @@ fn print_text_mode(
                     return;
                 }
             }
+            Ok(AgentEvent::ToolCall { name, arguments }) => {
+                if writeln!(out, "  [tool: {name}({arguments})]").is_err() {
+                    return;
+                }
+            }
             Ok(AgentEvent::Error(err)) => {
                 if writeln!(out, "error: {err}").is_err() {
                     return;

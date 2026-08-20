@@ -40,6 +40,12 @@ pub enum OutputMode {
                   with barge-in."
 )]
 pub struct Config {
+    /// Image file paths to include with the next user turn (multimodal
+    /// vision models). Accepts PNG, JPEG, GIF, WebP, BMP, TIFF, and PDF.
+    /// Repeat for multiple images: `--image a.png --image b.jpg`.
+    #[arg(long = "image", env = "SKADOOSH_IMAGE", value_name = "PATH")]
+    pub images: Vec<PathBuf>,
+
     /// Base URL of the OpenAI-compatible LLM API.
     #[arg(
         long,
@@ -141,6 +147,28 @@ pub struct Config {
     /// instead of playing it (headless-friendly).
     #[arg(long, env = "SKADOOSH_OUT_WAV", value_name = "PATH")]
     pub out_wav: Option<PathBuf>,
+
+    /// Path to a JSON file of tool/function definitions for tool calling.
+    /// Format: [{"type":"function","function":{"name":"...","description":"...","parameters":{...}}}]
+    #[arg(long, env = "SKADOOSH_TOOLS_FILE", value_name = "PATH")]
+    pub tools_file: Option<PathBuf>,
+
+    /// Maximum tool-calling round-trips before forcing a text response (default: 5).
+    #[arg(long, env = "SKADOOSH_MAX_TOOL_ROUNDS", default_value_t = 5)]
+    pub max_tool_rounds: usize,
+
+    /// Kokoro TTS voice key (e.g. "af", "am_adam"). Requires Kokoro model.
+    #[arg(long, env = "SKADOOSH_TTS_VOICE", default_value = "af")]
+    pub tts_voice: String,
+
+    /// TTS playback speed multiplier (0.5 – 2.0, default: 1.0).
+    #[arg(long, env = "SKADOOSH_TTS_SPEED", default_value_t = 1.0)]
+    pub tts_speed: f32,
+
+    /// Wake word to trigger listening (e.g. "hey skadoosh"). When set, the agent
+    /// only processes speech after the wake word is detected in the transcript.
+    #[arg(long, env = "SKADOOSH_WAKE_WORD")]
+    pub wake_word: Option<String>,
 }
 
 impl Default for Config {
@@ -148,6 +176,7 @@ impl Default for Config {
     /// `Config::default()` equals bare `skadoosh` with no flags).
     fn default() -> Self {
         Self {
+            images: Vec::new(),
             llm_url: "http://localhost:11434/v1".to_string(),
             llm_model: "qwen2.5:0.5b".to_string(),
             api_key: None,
@@ -168,6 +197,11 @@ impl Default for Config {
             say: None,
             output: OutputMode::Audio,
             out_wav: None,
+            tools_file: None,
+            max_tool_rounds: 5,
+            tts_voice: "af".to_string(),
+            tts_speed: 1.0,
+            wake_word: None,
         }
     }
 }
@@ -180,6 +214,7 @@ impl fmt::Debug for Config {
     /// considered here (and redacted too if ever secret).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            images,
             llm_url,
             llm_model,
             api_key,
@@ -200,8 +235,14 @@ impl fmt::Debug for Config {
             say,
             output,
             out_wav,
+            tools_file,
+            max_tool_rounds,
+            tts_voice,
+            tts_speed,
+            wake_word,
         } = self;
         f.debug_struct("Config")
+            .field("images", images)
             .field("llm_url", llm_url)
             .field("llm_model", llm_model)
             .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
@@ -222,6 +263,11 @@ impl fmt::Debug for Config {
             .field("say", say)
             .field("output", output)
             .field("out_wav", out_wav)
+            .field("tools_file", tools_file)
+            .field("max_tool_rounds", max_tool_rounds)
+            .field("tts_voice", tts_voice)
+            .field("tts_speed", tts_speed)
+            .field("wake_word", wake_word)
             .finish()
     }
 }
