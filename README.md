@@ -1,7 +1,7 @@
 # skadoosh
 
 [![crates.io](https://img.shields.io/crates/v/skadoosh.svg)](https://crates.io/crates/skadoosh)
-[![docs.rs](https://docs.rs/skadoosh/badge.svg?version=0.9.0)](https://docs.rs/skadoosh)
+[![docs.rs](https://docs.rs/skadoosh/badge.svg?version=0.10.0)](https://docs.rs/skadoosh)
 [![CI](https://github.com/Hot-Coco/Skadoosh/actions/workflows/ci.yml/badge.svg)](https://github.com/Hot-Coco/Skadoosh/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
