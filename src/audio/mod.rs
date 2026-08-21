@@ -3,27 +3,40 @@
 //! Capture converts device-rate input to 16 kHz mono and pushes it into a
 //! lock-free ring buffer; playback pops 24 kHz [`crate::tts::TtsClip`]s and
 //! resamples to the device rate. Real-time callbacks never allocate or lock.
+//!
+//! The cpal capture/playback modules (`input`, `output`) and the
+//! `aec` echo canceller are gated behind the `audio` feature (they need the
+//! system ALSA/speexdsp libraries); the pure-Rust [`resample`]r and
+//! [`hold_music`] generator are always available.
 
+#[cfg(feature = "audio")]
 pub mod aec;
 pub mod hold_music;
+#[cfg(feature = "audio")]
 pub mod input;
+#[cfg(feature = "audio")]
 pub mod output;
 pub mod resample;
 
 pub use hold_music::HoldMusic;
+#[cfg(feature = "audio")]
 pub use input::{list_devices, push_block_drop_count, AudioInputConfig, MicCapture, CAPTURE_RATE};
+#[cfg(feature = "audio")]
 pub use output::{
     push_clip_blocking, AudioOutputConfig, OutputPump, Playback, PlaybackHandle, CLIP_SAMPLE_RATE,
 };
 pub use resample::{resample_offline, LinearResampler};
 
+#[cfg(feature = "audio")]
 use cpal::traits::DeviceTrait;
 
+#[cfg(feature = "audio")]
 use crate::error::{AudioError, Result};
 
 /// Best-effort device name (cpal 0.18: `DeviceDescription::name()` with a
 /// `Display` fallback). Shared by input/output device picking and
 /// `--list-devices`.
+#[cfg(feature = "audio")]
 pub(crate) fn device_name(device: &cpal::Device) -> Option<String> {
     match device.description() {
         Ok(desc) => Some(desc.name().to_string()),
@@ -36,6 +49,7 @@ pub(crate) fn device_name(device: &cpal::Device) -> Option<String> {
 
 /// Picks the device named `name` from `devices`, or falls back to `default`
 /// when no name is configured. Shared by capture and playback setup.
+#[cfg(feature = "audio")]
 pub(crate) fn pick_device<I>(
     name: Option<&str>,
     devices: std::result::Result<I, cpal::Error>,
@@ -57,6 +71,7 @@ where
 /// report configurations is unusable (headless machines commonly list such a
 /// phantom ALSA "default" PCM); report it as "no suitable device" (the cause
 /// is logged).
+#[cfg(feature = "audio")]
 pub(crate) fn config_ranges<I>(
     kind: &str,
     configs: std::result::Result<I, cpal::Error>,
@@ -77,6 +92,7 @@ where
 /// a format prefers `preferred_rate` when the range covers it, else the
 /// range's maximum sample rate. Any channel count is accepted (the capture
 /// callback mixes down to mono; playback duplicates mono across channels).
+#[cfg(feature = "audio")]
 pub(crate) fn negotiate_config(
     ranges: &[cpal::SupportedStreamConfigRange],
     preferred_rate: u32,

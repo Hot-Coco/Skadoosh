@@ -74,6 +74,7 @@ fn base_config(llm_url: String) -> Config {
         out_wav: None,
         tools_file: None,
         max_tool_rounds: 5,
+        forward_url: None,
         tts_voice: "af".to_string(),
         tts_speed: 1.0,
         wake_word: None,

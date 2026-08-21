@@ -275,6 +275,10 @@ pub struct LlmClient {
     /// requests. When `None`, tool calls get a placeholder "not configured"
     /// result message.
     tool_executor: Option<Box<dyn ToolExecutor>>,
+    /// Optional call-forwarding tool. When `Some`, a `forward_call` tool is
+    /// registered and routed here (with the live conversation history) instead
+    /// of through the subprocess executor.
+    forward_tool: Option<crate::forward::ForwardTool>,
     /// Shared flag toggled on during tool execution for hold-music ducking.
     /// When `Some`, the pipeline can play hold music while tools run.
     pub(crate) hold_music_active: Option<Arc<AtomicBool>>,
@@ -312,6 +316,7 @@ impl LlmClient {
             tools: Vec::new(),
             max_tool_rounds: 5,
             tool_executor: None,
+            forward_tool: None,
             hold_music_active: None,
         }
     }
@@ -377,7 +382,7 @@ impl LlmClient {
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
-        let tools = if let Some(ref path) = config.tools_file {
+        let mut tools = if let Some(ref path) = config.tools_file {
             load_tools_file(path).unwrap_or_default()
         } else {
             Vec::new()
@@ -387,6 +392,18 @@ impl LlmClient {
         // placeholder result.
         let tool_executor: Option<Box<dyn ToolExecutor>> = if config.tools_file.is_some() {
             Some(Box::new(ShellExecutor::new()))
+        } else {
+            None
+        };
+        // When a forwarding endpoint is configured, auto-register the
+        // `forward_call` tool and build the executor that relays the
+        // conversation (with live history) to that endpoint.
+        let forward_tool = if let Some(ref url) = config.forward_url {
+            tracing::info!(forward_url = %url, "call forwarding enabled");
+            tools.push(crate::forward::forward_tool_definition());
+            Some(crate::forward::ForwardTool::new(
+                crate::forward::ForwardConfig::new(url.clone()),
+            ))
         } else {
             None
         };
@@ -401,6 +418,7 @@ impl LlmClient {
             tools,
             max_tool_rounds: config.max_tool_rounds,
             tool_executor,
+            forward_tool,
             hold_music_active,
             ..Self::new(
                 &config.llm_url,
@@ -646,7 +664,8 @@ impl LlmClient {
 
             // Tool result messages: run calls via the configured executor.
             // When multiple calls are present, execute them in parallel.
-            if self.tool_executor.is_some() {
+            let has_executor = self.tool_executor.is_some() || self.forward_tool.is_some();
+            if has_executor {
                 // Collect configured tool names for validation — rejects
                 // tool calls the model hallucinates that weren't defined.
                 let known: std::collections::HashSet<&str> = self
@@ -676,23 +695,67 @@ impl LlmClient {
                     .collect();
 
                 if batch.len() > 1 {
-                    tracing::info!(count = batch.len(), "executing tool calls in parallel");
+                    tracing::info!(count = batch.len(), "tool calls received");
                 }
 
-                // Only execute calls whose tool name was actually configured.
-                let validated: Vec<_> = batch
-                    .into_iter()
+                let mut results: BTreeMap<String, std::result::Result<String, SkadooshError>> =
+                    BTreeMap::new();
+
+                // Route `forward_call` to the ForwardTool, passing the live
+                // conversation history so the forwarded service gets full
+                // context. Unknown tool names are warned and skipped below.
+                if let Some(ref forward) = self.forward_tool {
+                    let current_query = last_user_text(&self.history);
+                    let mut forwarded = 0usize;
+                    for (name, args, call_id) in &batch {
+                        if name == crate::forward::FORWARD_TOOL_NAME
+                            && known.contains(name.as_str())
+                        {
+                            forwarded += 1;
+                            let (reason, summary) = crate::forward::parse_forward_args(args);
+                            let res = forward
+                                .forward(&self.history, &current_query, &reason, &summary)
+                                .await;
+                            if let Err(ref e) = res {
+                                tracing::warn!(tool = %name, error = %e, "forward call failed");
+                            }
+                            results.insert(call_id.clone(), res);
+                        }
+                    }
+                    if forwarded > 0 {
+                        tracing::info!(count = forwarded, "forwarded calls to external service");
+                    }
+                }
+
+                // Remaining configured tool calls run as subprocesses through
+                // the existing parallel executor.
+                let shell_batch: Vec<(String, String, String)> = batch
+                    .iter()
                     .filter(|(name, _, _)| {
-                        if known.contains(name.as_str()) {
+                        if name == crate::forward::FORWARD_TOOL_NAME {
+                            false
+                        } else if known.contains(name.as_str()) {
                             true
                         } else {
                             tracing::warn!(tool=%name, "rejected unknown tool call");
                             false
                         }
                     })
+                    .cloned()
                     .collect();
 
-                let results = execute_parallel(validated).await;
+                if self.tool_executor.is_some() && !shell_batch.is_empty() {
+                    if shell_batch.len() > 1 {
+                        tracing::info!(
+                            count = shell_batch.len(),
+                            "executing tool calls in parallel"
+                        );
+                    }
+                    let shell_results = execute_parallel(shell_batch).await;
+                    for (call_id, result) in shell_results {
+                        results.insert(call_id, result);
+                    }
+                }
 
                 // Re-assemble results in the original call order for history.
                 for tc in &calls {
@@ -784,6 +847,19 @@ impl LlmClient {
             self.history.drain(1..=drop);
         }
     }
+}
+
+/// Returns the text of the most recent `user` message in `history`, or the
+/// empty string if there is none. Used as the `current_query` forwarded to an
+/// external service.
+fn last_user_text(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_text())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Passes a success response through; a non-success status becomes
@@ -923,5 +999,50 @@ pub fn parse_sse_delta(line: &str) -> Option<Result<SseDelta>> {
         None
     } else {
         Some(Ok(SseDelta::Text(token.to_string())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// `from_config` auto-registers the `forward_call` tool definition and a
+    /// [`crate::forward::ForwardTool`] when `forward_url` is set, and
+    /// registers neither when it is unset.
+    #[test]
+    fn from_config_registers_forward_tool_when_url_set() {
+        let config = Config {
+            forward_url: Some("http://example/forward".to_string()),
+            ..Default::default()
+        };
+
+        let client = LlmClient::from_config(&config);
+        let names: Vec<&str> = client
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&crate::forward::FORWARD_TOOL_NAME),
+            "forward_call tool must be registered: {names:?}"
+        );
+        assert!(
+            client.forward_tool.is_some(),
+            "ForwardTool executor must be wired when --forward-url is set"
+        );
+
+        // Without forward_url, neither the tool nor the executor is present.
+        let bare = LlmClient::from_config(&Config::default());
+        let bare_names: Vec<&str> = bare
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            !bare_names.contains(&crate::forward::FORWARD_TOOL_NAME),
+            "forward_call must not be registered without --forward-url: {bare_names:?}"
+        );
+        assert!(bare.forward_tool.is_none());
     }
 }

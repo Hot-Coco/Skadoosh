@@ -157,6 +157,13 @@ pub struct Config {
     #[arg(long, env = "SKADOOSH_MAX_TOOL_ROUNDS", default_value_t = 5)]
     pub max_tool_rounds: usize,
 
+    /// URL of an external service to forward conversations to when the LLM
+    /// cannot answer. When set, a `forward_call` tool is auto-registered so
+    /// the model can hand off the conversation; the forwarded service's text
+    /// response is relayed back to the user as the tool result.
+    #[arg(long, env = "SKADOOSH_FORWARD_URL", value_name = "URL")]
+    pub forward_url: Option<String>,
+
     /// Kokoro TTS voice key (e.g. "af", "am_adam"). Requires Kokoro model.
     #[arg(long, env = "SKADOOSH_TTS_VOICE", default_value = "af")]
     pub tts_voice: String,
@@ -223,6 +230,7 @@ impl Default for Config {
             out_wav: None,
             tools_file: None,
             max_tool_rounds: 5,
+            forward_url: None,
             tts_voice: "af".to_string(),
             tts_speed: 1.0,
             wake_word: None,
@@ -265,6 +273,7 @@ impl fmt::Debug for Config {
             out_wav,
             tools_file,
             max_tool_rounds,
+            forward_url,
             tts_voice,
             tts_speed,
             wake_word,
@@ -297,6 +306,7 @@ impl fmt::Debug for Config {
             .field("out_wav", out_wav)
             .field("tools_file", tools_file)
             .field("max_tool_rounds", max_tool_rounds)
+            .field("forward_url", forward_url)
             .field("tts_voice", tts_voice)
             .field("tts_speed", tts_speed)
             .field("wake_word", wake_word)

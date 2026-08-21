@@ -1,8 +1,9 @@
 //! Speech-to-text: the pluggable [`SttEngine`] trait, the whisper-rs
-//! implementation ([`WhisperStt`], on a dedicated blocking std thread so the
-//! synchronous whisper.cpp API stays off the async runtime), and the
-//! scripted [`MockStt`] double for SDK users' tests.
+//! implementation (`WhisperStt`, on a dedicated blocking std thread so the
+//! synchronous whisper.cpp API stays off the async runtime — gated behind the
+//! `audio` feature), and the scripted [`MockStt`] double for SDK users' tests.
 
+#[cfg(feature = "audio")]
 pub mod whisper;
 
 use std::collections::VecDeque;
@@ -11,13 +12,15 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+#[cfg(feature = "audio")]
 pub use whisper::{SttConfig, WhisperStt};
 
 use crate::error::Result;
 
 /// Pluggable speech-to-text engine.
 ///
-/// Mirrors the working shape of [`WhisperStt`]: `transcribe` hands the
+/// Mirrors the working shape of `WhisperStt` (gated behind the `audio`
+/// feature): `transcribe` hands the
 /// engine one 16 kHz f32 mono segment and returns a
 /// [`oneshot::Receiver`] for the reply, so the pipeline's STT bridge can
 /// `await` it like any other stage. A dropped reply sender (the receiver

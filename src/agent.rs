@@ -1,9 +1,10 @@
 //! The SDK facade: one [`Agent`] type that assembles the voice pipeline
 //! from a [`Config`] plus optional engine trait objects, broadcasts
 //! [`AgentEvent`]s, and offers the three entry points an embedding
-//! application needs — [`run`](Agent::run) (full audio loop),
+//! application needs — `run` (full audio loop, behind the `audio` feature),
 //! [`text_turn`](Agent::text_turn) / [`repl`](Agent::repl) (text-in), and
-//! [`say`](Agent::say) / [`say_to_wav`](Agent::say_to_wav) (speech out).
+//! `say` (behind the `audio` feature) / [`say_to_wav`](Agent::say_to_wav)
+//! (speech out).
 //!
 //! # Quickstart
 //!
@@ -25,7 +26,7 @@
 //! [`AgentBuilder::llm`] an [`LlmBackend`], and
 //! [`AgentBuilder::tts`] a [`TtsEngine`]. Stages
 //! left unset are built from the [`Config`] exactly like the binary does
-//! ([`WhisperStt`](crate::stt::WhisperStt) → [`LlmClient`] →
+//! (`WhisperStt` → [`LlmClient`] →
 //! [`build_engine`]). Only the stages a mode
 //! actually uses are built: [`text_turn`](Agent::text_turn) never touches
 //! STT, and [`repl`](Agent::repl) never touches STT or TTS — so a text-only
@@ -47,19 +48,32 @@ use std::path::Path;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "audio")]
 use crate::audio::{AudioOutputConfig, Playback, PlaybackHandle};
 use crate::config::{Config, OutputMode};
 use crate::error::Result;
 use crate::llm::client::{CLAUSE_MAX_LEN, CLAUSE_MIN_LEN};
 use crate::llm::{ClauseSplitter, LlmBackend, LlmClient};
-use crate::pipeline::{write_wav16, Pipeline};
+#[cfg(feature = "audio")]
+use crate::pipeline::Pipeline;
 use crate::stt::SttEngine;
 use crate::tts::{build_engine, concat_clip_samples, TtsClip, TtsEngine, TTS_SAMPLE_RATE};
+use crate::wav::write_wav16;
+
+/// The concrete type queued clips are handed to. With the `audio` feature it
+/// is [`Playback`] / [`PlaybackHandle`] (cpal playback); without it the
+/// text/REPL paths still compile by discarding clips onto this no-op `()`
+/// sink — they never receive a clip in practice (no playback field exists,
+/// so `text_turn`/`repl` always pass `None`).
+#[cfg(feature = "audio")]
+type ClipSink = PlaybackHandle;
+#[cfg(not(feature = "audio"))]
+type ClipSink = ();
 
 /// Capacity of the [`AgentEvent`] broadcast channel (subscribers that lag
 /// more than this see `RecvError::Lagged`). Shared with
-/// [`Pipeline::new`](crate::pipeline::Pipeline::new), which builds the same
-/// bus for non-SDK runs.
+/// `Pipeline::new` (in the `pipeline` module, behind the `audio` feature),
+/// which builds the same bus for non-SDK runs.
 pub(crate) const EVENT_CAP: usize = 64;
 
 /// Capacity of the per-turn clause channel between the LLM backend and the
@@ -83,7 +97,8 @@ pub enum AgentEvent {
     /// fires.) A cancelled turn does not re-emit it.
     Listening,
     /// Speech onset detected by the VAD (past the 2-frame barge-in
-    /// hangover). Full audio pipeline ([`Agent::run`]) only.
+    /// hangover). Full audio pipeline (`Agent::run`, behind the `audio`
+    /// feature) only.
     SpeechStart,
     /// A user utterance was transcribed (STT output, LLM input).
     Transcript(String),
@@ -143,7 +158,8 @@ pub enum AgentEvent {
         total_ms: u64,
     },
     /// A stage failed fatally (the pipeline is shutting down; the
-    /// originating error is also returned by [`Agent::run`]).
+    /// originating error is also returned by `Agent::run`, behind the
+    /// `audio` feature).
     Error(String),
 }
 
@@ -154,13 +170,18 @@ pub enum AgentEvent {
 /// thread freely.
 pub struct Agent {
     config: Config,
+    /// Injected STT engine; only consumed by `run` (behind the `audio`
+    /// feature), so it is stored-but-unused in a no-`audio` build.
+    #[cfg_attr(not(feature = "audio"), allow(dead_code))]
     stt: Option<Box<dyn SttEngine>>,
     llm: Option<Box<dyn LlmBackend>>,
     tts: Option<Box<dyn TtsEngine>>,
     events: broadcast::Sender<AgentEvent>,
     shutdown: CancellationToken,
     /// Lazily started playback for the audio-producing text paths
-    /// (`text_turn` in audio mode, `say`).
+    /// (`text_turn` in audio mode, `say`). Only present with the `audio`
+    /// feature (cpal playback).
+    #[cfg(feature = "audio")]
     playback: Option<(Playback, PlaybackHandle)>,
 }
 
@@ -185,8 +206,8 @@ impl Agent {
     }
 
     /// Subscribes to the agent's event stream. Call before
-    /// [`run`](Agent::run) (or any text entry point) — receivers only see
-    /// events emitted after they subscribe.
+    /// `run` (behind the `audio` feature) (or any text entry point) —
+    /// receivers only see events emitted after they subscribe.
     pub fn events(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
     }
@@ -204,6 +225,7 @@ impl Agent {
     /// converts them) — unlike the per-call entry points
     /// ([`text_turn`](Agent::text_turn), [`repl`](Agent::repl),
     /// [`say`](Agent::say)), which re-raise engine panics on the caller.
+    #[cfg(feature = "audio")]
     pub fn run(mut self) -> Result<()> {
         Pipeline::from_parts(
             self.config.clone(),
@@ -226,9 +248,9 @@ impl Agent {
     /// clip has been handed to the playback ring — up to the ring's
     /// capacity (~2 s) of audio may still be playing when the call
     /// returns, and dropping the `Agent` right afterwards truncates that
-    /// tail ([`Drop`] stops playback abruptly; use [`say`](Agent::say)
-    /// when the speech must have finished). In [`OutputMode::Text`] no TTS
-    /// runs.
+    /// tail ([`Drop`] stops playback abruptly; use `say` (behind the
+    /// `audio` feature) when the speech must have finished). In
+    /// [`OutputMode::Text`] no TTS runs.
     ///
     /// Conversation history accumulates across calls (bounded by
     /// `Config::max_history_turns`); see the [`LlmBackend`] history note.
@@ -237,8 +259,8 @@ impl Agent {
     ///
     /// A panic in the LLM backend or TTS engine is re-raised on the caller
     /// (the scoped worker's panic propagates via `resume_unwind`) —
-    /// unlike [`run`](Agent::run), which converts stage panics into
-    /// `Err`s.
+    /// unlike `run` (behind the `audio` feature), which converts stage
+    /// panics into `Err`s.
     pub fn text_turn(&mut self, input: &str) -> Result<String> {
         // Split borrows: each field is borrowed disjointly, so the lazily
         // built config-default stages can sit next to the shared handles.
@@ -247,7 +269,6 @@ impl Agent {
             tts,
             events,
             config,
-            playback,
             ..
         } = self;
         let llm = ensure_llm(llm, config);
@@ -255,11 +276,17 @@ impl Agent {
             OutputMode::Audio => Some(ensure_tts(tts, config)?),
             OutputMode::Text => None,
         };
-        let playback = if tts.is_some() {
-            Some(lazy_playback(playback, config)?.1.clone())
+        // Lazily start playback only when audio output is possible. Without
+        // the `audio` feature there is no playback field, so no clips are
+        // ever queued (`text_turn_async` receives `None`).
+        #[cfg(feature = "audio")]
+        let playback: Option<ClipSink> = if tts.is_some() {
+            Some(lazy_playback(&mut self.playback, config)?.1.clone())
         } else {
             None
         };
+        #[cfg(not(feature = "audio"))]
+        let playback: Option<ClipSink> = None;
         let events = events.clone();
         run_scoped(move || async move {
             let mut tts = tts;
@@ -347,6 +374,7 @@ impl Agent {
     ///
     /// A panic in the TTS engine is re-raised on the caller (see
     /// [`text_turn`](Agent::text_turn)'s note).
+    #[cfg(feature = "audio")]
     pub fn say(&mut self, text: &str) -> Result<()> {
         // Synthesize first: unspeakable text must be rejected before the
         // output device is touched.
@@ -364,16 +392,16 @@ impl Agent {
         })
     }
 
-    /// One-shot text→speech to a file: like [`say`](Agent::say), but writes
-    /// a 24 kHz 16-bit mono wav instead of playing — no audio device
-    /// needed.
+    /// One-shot text→speech to a file: like `say` (behind the `audio`
+    /// feature), but writes a 24 kHz 16-bit mono wav instead of playing —
+    /// no audio device needed.
     pub fn say_to_wav(&mut self, text: &str, path: &Path) -> Result<()> {
         let clips = self.synthesize_clips(text)?;
         write_wav16(path, &concat_clip_samples(&clips), TTS_SAMPLE_RATE)
     }
 
-    /// Requests a graceful shutdown of [`run`](Agent::run) (the binary
-    /// bridges SIGINT onto this).
+    /// Requests a graceful shutdown of `run` (behind the `audio` feature;
+    /// the binary bridges SIGINT onto this).
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
@@ -408,8 +436,8 @@ impl AgentBuilder {
         self
     }
 
-    /// Injects a custom speech-to-text engine (used by
-    /// [`Agent::run`](Agent::run) only).
+    /// Injects a custom speech-to-text engine (used by `Agent::run`, behind
+    /// the `audio` feature, only).
     pub fn stt(mut self, engine: Box<dyn SttEngine>) -> Self {
         self.stt = Some(engine);
         self
@@ -422,8 +450,9 @@ impl AgentBuilder {
     }
 
     /// Injects a custom TTS engine (used by the audio output paths:
-    /// [`Agent::run`](Agent::run) in audio mode, [`Agent::say`], and
-    /// audio-mode [`Agent::text_turn`](Agent::text_turn)).
+    /// `Agent::run` in audio mode, `Agent::say`, and audio-mode
+    /// [`Agent::text_turn`](Agent::text_turn)). `run` and `say` are behind
+    /// the `audio` feature.
     pub fn tts(mut self, engine: Box<dyn TtsEngine>) -> Self {
         self.tts = Some(engine);
         self
@@ -442,6 +471,7 @@ impl AgentBuilder {
             tts: self.tts,
             events,
             shutdown: CancellationToken::new(),
+            #[cfg(feature = "audio")]
             playback: None,
         })
     }
@@ -449,15 +479,17 @@ impl AgentBuilder {
 
 impl Drop for Agent {
     /// Stops the lazily-started playback thread abruptly
-    /// ([`Playback::stop`]): any audio still queued or sitting in the
-    /// playback ring is discarded — dropping an `Agent` right after
-    /// queueing audio truncates playback. The audio-producing entry
-    /// points bound that by construction: [`say`](Agent::say) returns
-    /// only after playback has fully drained, and audio-mode
+    /// (`Playback::stop`, behind the `audio` feature): any audio still
+    /// queued or sitting in the playback ring is discarded — dropping an
+    /// `Agent` right after queueing audio truncates playback. The
+    /// audio-producing entry points bound that by construction: `say`
+    /// returns only after playback has fully drained, and audio-mode
     /// [`text_turn`](Agent::text_turn) only after every clip is in the
-    /// ring (≤ ~2 s of audio in flight).
+    /// ring (≤ ~2 s of audio in flight). Without the `audio` feature the
+    /// `Agent` owns no playback thread, so `drop` is a no-op.
     fn drop(&mut self) {
         // Join the playback thread if text_turn/say started one.
+        #[cfg(feature = "audio")]
         if let Some((playback, _)) = self.playback.take() {
             playback.stop();
         }
@@ -487,6 +519,7 @@ fn ensure_tts<'a>(
 }
 
 /// Starts playback on first use, returning the (now guaranteed) pair.
+#[cfg(feature = "audio")]
 fn lazy_playback<'a>(
     slot: &'a mut Option<(Playback, PlaybackHandle)>,
     config: &Config,
@@ -507,7 +540,7 @@ fn lazy_playback<'a>(
 async fn text_turn_async(
     llm: &mut dyn LlmBackend,
     tts: &mut Option<&mut dyn TtsEngine>,
-    playback: Option<PlaybackHandle>,
+    playback: Option<ClipSink>,
     events: &broadcast::Sender<AgentEvent>,
     input: &str,
     mut on_clause: impl FnMut(&str) -> Result<()>,
@@ -553,6 +586,7 @@ async fn text_turn_async(
             // have all been handed to the playback ring, so the unplayed
             // tail is bounded by the ring capacity (see the text_turn
             // docs for the drop-truncation caveat).
+            #[cfg(feature = "audio")]
             if let Some(handle) = &playback {
                 handle.wait_buffered().await;
             }
@@ -567,22 +601,34 @@ async fn text_turn_async(
 /// One clause of a text turn: accumulate into the reply, broadcast the
 /// event, run the caller's callback, and optionally synthesize + play.
 /// Clause synthesis blocks the (private, current-thread) runtime briefly —
-/// acceptable for the sync facade; [`Agent::run`] is the latency-critical
-/// path and synthesizes on the blocking pool.
+/// acceptable for the sync facade; `Agent::run` (behind the `audio`
+/// feature) is the latency-critical path and synthesizes on the blocking
+/// pool.
 async fn handle_clause(
     reply: &mut String,
     clause: String,
     events: &broadcast::Sender<AgentEvent>,
     on_clause: &mut impl FnMut(&str) -> Result<()>,
     tts: &mut Option<&mut dyn TtsEngine>,
-    playback: &Option<PlaybackHandle>,
+    playback: &Option<ClipSink>,
 ) -> Result<()> {
     reply.push_str(&clause);
     let _ = events.send(AgentEvent::Clause(clause.clone()));
     on_clause(&clause)?;
     if let (Some(engine), Some(handle)) = (tts.as_deref_mut(), playback) {
         let clip = engine.synthesize(&clause)?;
-        handle.queue_clip(clip).await?;
+        #[cfg(feature = "audio")]
+        {
+            handle.queue_clip(clip).await?;
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            // No `audio` feature: no playback device exists, so the
+            // synthesized clip is dropped. (Unreachable in practice — the
+            // callers always pass `None` — but keeps the body compiling
+            // without the cpal stack.)
+            let _ = (clip, handle);
+        }
     }
     Ok(())
 }

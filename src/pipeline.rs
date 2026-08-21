@@ -70,6 +70,7 @@ use crate::llm::{parse_sse_line, ClauseSplitter, LlmBackend, LlmClient};
 use crate::stt::{SttConfig, SttEngine, WhisperStt};
 use crate::tts::{build_engine, concat_clip_samples, TtsClip, TtsEngine, TTS_SAMPLE_RATE};
 use crate::vad::{SileroVad, VadEvent, VadSegmenter, FRAME_LEN};
+use crate::wav::write_wav16;
 
 /// VAD-events channel capacity (§7).
 const VAD_EVENTS_CAP: usize = 8;
@@ -1737,32 +1738,6 @@ fn read_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
         mono.push(acc / channels as f32);
     }
     Ok((mono, rate))
-}
-
-/// Writes a canonical 44-byte-header 16-bit PCM mono wav. Crate-visible:
-/// shared by `--selftest` and `--say --out-wav`.
-pub(crate) fn write_wav16(path: &Path, samples: &[f32], rate: u32) -> Result<()> {
-    let data_len = (samples.len() * 2) as u32;
-    let mut out = Vec::with_capacity(44 + data_len as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&rate.to_le_bytes());
-    out.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
-    out.extend_from_slice(&2u16.to_le_bytes()); // block align
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    for &s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    std::fs::write(path, &out)
-        .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", path.display()).into())
 }
 
 /// Background task: watches the hold-music active flag and feeds

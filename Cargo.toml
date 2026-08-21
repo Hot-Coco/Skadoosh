@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -19,14 +19,23 @@ path = "src/lib.rs"
 [[bin]]
 name = "skadoosh"
 path = "src/main.rs"
+required-features = ["audio"]
 
 [features]
-default = ["download-binaries"]
+default = ["download-binaries", "audio"]
 ## Build-time download of a prebuilt ONNX Runtime (default). Disable default
 ## features and enable `load-dynamic` to link a system ONNX Runtime at
 ## runtime instead (what docs.rs uses, since its sandbox has no network).
 download-binaries = ["ort/download-binaries", "ort/tls-rustls", "ort/copy-dylibs"]
 load-dynamic = ["ort/load-dynamic"]
+## Hardware audio I/O and the full voice pipeline: cpal mic capture/playback,
+## Silero VAD, whisper-rs STT, and aec-rs echo cancellation. Enabled by
+## default. Disable it (`--no-default-features`) for a text-only / docs build
+## that pulls in none of the system audio libraries (libasound2-dev,
+## libclang-dev): the SDK traits, `Agent` text/REPL/`say_to_wav` paths, and the
+## mock engines stay available — only mic capture, playback, VAD, whisper STT,
+## echo cancellation, and the pipeline orchestrator are gated out.
+audio = ["dep:cpal", "dep:whisper-rs", "dep:aec-rs"]
 ## GPU execution-provider feature flags. Enable exactly one for your platform.
 ## None enabled by default — ONNX Runtime falls back to CPU.
 ## * `gpu-cuda` — NVIDIA CUDA (requires CUDA toolkit at build time).
@@ -40,8 +49,8 @@ gpu-rocm = ["ort/rocm"]
 
 [dependencies]
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-27"] }
-whisper-rs = "=0.15.1"
-cpal = "=0.18"
+whisper-rs = { version = "=0.15.1", optional = true }
+cpal = { version = "=0.18", optional = true }
 ringbuf = "=0.4"
 reqwest = { version = "=0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -55,7 +64,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "=4", features = ["derive", "env"] }
 base64 = "=0.22"
-aec-rs = "=1"
+aec-rs = { version = "=1", optional = true }
 misaki-rs = "0.3"
 crossterm = "=0.28"
 
@@ -124,6 +133,7 @@ path = "cookbooks/10_config_modes.rs"
 [[example]]
 name = "11_barge_in"
 path = "cookbooks/11_barge_in.rs"
+required-features = ["audio"]
 
 [[example]]
 name = "12_mock_pipeline"
@@ -140,3 +150,14 @@ path = "cookbooks/14_wake_word.rs"
 [[example]]
 name = "15_push_to_talk"
 path = "cookbooks/15_push_to_talk.rs"
+
+# Auto-discovered from `examples/`; the full voice pipeline (mic/VAD/STT/
+# playback) needs the `audio` feature's system libraries, so they are skipped
+# in a no-`audio` (text-only / docs) build.
+[[example]]
+name = "mock_agent"
+required-features = ["audio"]
+
+[[example]]
+name = "voice_agent"
+required-features = ["audio"]
