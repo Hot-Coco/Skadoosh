@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -67,10 +67,26 @@ base64 = "=0.22"
 aec-rs = { version = "=1", optional = true }
 misaki-rs = "0.3"
 crossterm = "=0.28"
+# WASM skill/plugin sandbox (`--plugins-dir`). Default features are disabled to
+# keep the dependency footprint small: the plugin system only needs the Cranelift
+# compiler, the runtime, and std — no GC, pooling allocator, component model,
+# async, or cache. Fuel-gated execution and the ResourceLimiter are ungated.
+wasmtime = { version = "30", default-features = false, features = ["cranelift", "runtime", "std"] }
+
+# Unix-only: used by the sandbox to read the inherited RLIMIT hard ceilings
+# so the subprocess sandbox never asks `ulimit` to raise a limit above them.
+# (`rlimit::Resource` is only exported on unix; gating the dep avoids pulling
+# it in on Windows/text-only builds.)
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
+notify = "7"
 
 [dev-dependencies]
 hound = "=3"
 tokio = { version = "1", features = ["full"] }
+# WAT parser used by the plugin integration test to synthesize a minimal
+# `.wasm` plugin in-memory (no toolchain needed to run the tests).
+wat = "1"
 
 # Keep whisper.cpp/ort-heavy dev builds usable.
 [profile.dev.package."*"]

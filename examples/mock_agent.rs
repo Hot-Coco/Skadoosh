@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         events,
         wake_word: None,
         hold_music: None,
+        watch_rx: None,
     }));
 
     // One scripted voice turn: a one-second "segment" (contents are ignored

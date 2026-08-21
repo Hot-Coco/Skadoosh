@@ -164,6 +164,16 @@ pub struct Config {
     #[arg(long, env = "SKADOOSH_FORWARD_URL", value_name = "URL")]
     pub forward_url: Option<String>,
 
+    /// Directory of `.wasm` skill plugins to load and auto-register with the
+    /// LLM as function-calling tools (see `PLUGINS.md`). Each plugin runs in a
+    /// sandboxed wasmtime instance with a fuel budget and no filesystem or
+    /// network access. When unset, the default `~/.skadoosh/plugins/` is used
+    /// if it exists (otherwise no plugins load silently); an explicitly
+    /// configured directory that is missing logs a warning and continues
+    /// without plugins.
+    #[arg(long, env = "SKADOOSH_PLUGINS_DIR", value_name = "PATH")]
+    pub plugins_dir: Option<PathBuf>,
+
     /// Kokoro TTS voice key (e.g. "af", "am_adam"). Requires Kokoro model.
     #[arg(long, env = "SKADOOSH_TTS_VOICE", default_value = "af")]
     pub tts_voice: String,
@@ -200,6 +210,105 @@ pub struct Config {
     /// calm/sad). Requires Kokoro TTS model.
     #[arg(long, env = "SKADOOSH_TTS_EMOTION", default_value_t = false)]
     pub tts_emotion: bool,
+
+    /// Enable multi-agent mesh networking: LAN peer discovery via UDP
+    /// broadcast and a tiny HTTP server that accepts `forward_call` requests
+    /// from peer agents. When set, the `forward_call` tool is extended with a
+    /// `target` peer-name argument so the model can route a call to a
+    /// discovered agent instead of the `--forward-url` endpoint.
+    #[arg(long, env = "SKADOOSH_MESH", default_value_t = false)]
+    pub mesh: bool,
+
+    /// UDP discovery + HTTP port for the mesh (default 9876). Both the UDP
+    /// discovery socket and the HTTP server bind this port number — UDP and
+    /// TCP are distinct protocols, so they never collide.
+    #[arg(long, env = "SKADOOSH_MESH_PORT", default_value_t = 9876)]
+    pub mesh_port: u16,
+
+    /// Name for this node in the mesh. When `--mesh` is enabled but no name
+    /// is given, the node defaults to `skadoosh-<pid>`.
+    #[arg(long, env = "SKADOOSH_AGENT_NAME", value_name = "NAME")]
+    pub agent_name: Option<String>,
+
+    /// Directory of documents (`.txt`/`.md`) to index for retrieval-augmented
+    /// generation. When set, the LLM client loads and embeds the docs once on
+    /// startup, then injects the `--rag-top-k` most relevant chunks into the
+    /// system prompt before each turn (run
+    /// `scripts/download_models.sh --with-rag` for the embedding model).
+    #[arg(long, env = "SKADOOSH_RAG_DIR", value_name = "PATH")]
+    pub rag_dir: Option<PathBuf>,
+
+    /// Number of retrieved chunks injected into the system prompt per turn
+    /// (only used with `--rag-dir`).
+    #[arg(long, env = "SKADOOSH_RAG_TOP_K", default_value_t = 3)]
+    pub rag_top_k: usize,
+
+    /// Path to the sentence-embedding ONNX model used by `--rag-dir`
+    /// (all-MiniLM-L6-v2 by default). Its companion BERT vocab is expected at
+    /// `<stem>-vocab.txt` next to the model, e.g.
+    /// `models/all-MiniLM-L6-v2-vocab.txt`.
+    #[arg(
+        long,
+        env = "SKADOOSH_RAG_MODEL",
+        default_value = crate::rag::DEFAULT_RAG_MODEL
+    )]
+    pub rag_model: PathBuf,
+
+    /// Path to the conversation-memory JSON file. When set, the agent
+    /// remembers user preferences across runs (injecting them into the
+    /// system prompt) and appends a summary of each completed turn. Unset
+    /// by default — no memory unless configured.
+    #[arg(long, env = "SKADOOSH_MEMORY_FILE", value_name = "PATH")]
+    pub memory_file: Option<PathBuf>,
+
+    /// File to watch for changes (`--watch-file` / `SKADOOSH_WATCH_FILE`).
+    /// When the file changes, a `NOTIFICATION: The file <path> has changed.`
+    /// user turn is injected into the conversation. Repeatable:
+    /// `--watch-file a.txt --watch-file b.txt`.
+    #[arg(long = "watch-file", env = "SKADOOSH_WATCH_FILE", value_name = "PATH")]
+    pub watch_files: Vec<PathBuf>,
+
+    /// Process ID to watch for exit (`--watch-process` /
+    /// `SKADOOSH_WATCH_PROCESS`). When the process exits, a
+    /// `NOTIFICATION: Process <pid> has exited.` user turn is injected.
+    /// Repeatable. Linux only (polls `/proc/<pid>`).
+    #[arg(
+        long = "watch-process",
+        env = "SKADOOSH_WATCH_PROCESS",
+        value_name = "PID"
+    )]
+    pub watch_processes: Vec<u32>,
+
+    /// Timer in seconds (`--watch-timer` / `SKADOOSH_WATCH_TIMER`). When it
+    /// elapses, a `NOTIFICATION: Your <n>-second timer is up.` user turn is
+    /// injected. Repeatable.
+    #[arg(
+        long = "watch-timer",
+        env = "SKADOOSH_WATCH_TIMER",
+        value_name = "SECONDS"
+    )]
+    pub watch_timers: Vec<u64>,
+
+    /// Sandboxed code-execution tool. When set, a `code_exec` tool is
+    /// auto-registered so the model can run Python, shell, or binary snippets
+    /// in a restricted subprocess (or Docker container) and receive stdout,
+    /// stderr, and the exit code back. The value is the per-run wall-clock
+    /// timeout in seconds (the sandbox's own default is 30). Unset by default
+    /// — no code execution unless configured.
+    #[arg(long, env = "SKADOOSH_CODE_EXEC_TIMEOUT", value_name = "SECONDS")]
+    pub code_exec_timeout: Option<u64>,
+
+    /// Sandbox backend for `--code-exec-timeout`: `subprocess` (host ulimits
+    /// + scrubbed env + best-effort network namespace) or `docker` (ephemeral
+    ///   `--network none` container). Only meaningful when
+    ///   `--code-exec-timeout` is set; defaults to `subprocess`.
+    #[arg(
+        long,
+        env = "SKADOOSH_CODE_EXEC_SANDBOX",
+        value_enum,
+        default_value_t = crate::sandbox::SandboxMode::Subprocess
+    )]
+    pub code_exec_sandbox: crate::sandbox::SandboxMode,
 }
 
 impl Default for Config {
@@ -231,6 +340,7 @@ impl Default for Config {
             tools_file: None,
             max_tool_rounds: 5,
             forward_url: None,
+            plugins_dir: None,
             tts_voice: "af".to_string(),
             tts_speed: 1.0,
             wake_word: None,
@@ -238,6 +348,18 @@ impl Default for Config {
             hold_music: false,
             whisper_model_size: "tiny".to_string(),
             tts_emotion: false,
+            mesh: false,
+            mesh_port: 9876,
+            agent_name: None,
+            rag_dir: None,
+            rag_top_k: 3,
+            rag_model: PathBuf::from(crate::rag::DEFAULT_RAG_MODEL),
+            memory_file: None,
+            watch_files: Vec::new(),
+            watch_processes: Vec::new(),
+            watch_timers: Vec::new(),
+            code_exec_timeout: None,
+            code_exec_sandbox: crate::sandbox::SandboxMode::Subprocess,
         }
     }
 }
@@ -274,6 +396,7 @@ impl fmt::Debug for Config {
             tools_file,
             max_tool_rounds,
             forward_url,
+            plugins_dir,
             tts_voice,
             tts_speed,
             wake_word,
@@ -281,6 +404,18 @@ impl fmt::Debug for Config {
             hold_music,
             whisper_model_size,
             tts_emotion,
+            mesh,
+            mesh_port,
+            agent_name,
+            rag_dir,
+            rag_top_k,
+            rag_model,
+            memory_file,
+            watch_files,
+            watch_processes,
+            watch_timers,
+            code_exec_timeout,
+            code_exec_sandbox,
         } = self;
         f.debug_struct("Config")
             .field("images", images)
@@ -307,6 +442,7 @@ impl fmt::Debug for Config {
             .field("tools_file", tools_file)
             .field("max_tool_rounds", max_tool_rounds)
             .field("forward_url", forward_url)
+            .field("plugins_dir", plugins_dir)
             .field("tts_voice", tts_voice)
             .field("tts_speed", tts_speed)
             .field("wake_word", wake_word)
@@ -314,6 +450,18 @@ impl fmt::Debug for Config {
             .field("hold_music", hold_music)
             .field("whisper_model_size", whisper_model_size)
             .field("tts_emotion", tts_emotion)
+            .field("mesh", mesh)
+            .field("mesh_port", mesh_port)
+            .field("agent_name", agent_name)
+            .field("rag_dir", rag_dir)
+            .field("rag_top_k", rag_top_k)
+            .field("rag_model", rag_model)
+            .field("memory_file", memory_file)
+            .field("watch_files", watch_files)
+            .field("watch_processes", watch_processes)
+            .field("watch_timers", watch_timers)
+            .field("code_exec_timeout", code_exec_timeout)
+            .field("code_exec_sandbox", code_exec_sandbox)
             .finish()
     }
 }

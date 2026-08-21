@@ -64,6 +64,40 @@ pub fn forward_tool_definition() -> crate::llm::Tool {
     )
 }
 
+/// The mesh-extended `forward_call` tool definition: adds an optional
+/// `target` peer-name argument so the model can route the call to a
+/// discovered mesh agent. A call without `target` still falls back to the
+/// `--forward-url` endpoint.
+///
+/// Arguments the model provides:
+/// `{"target": "agent-name", "reason": "...", "summary": "..."}`.
+pub fn mesh_forward_tool_definition() -> crate::llm::Tool {
+    crate::llm::Tool::function(
+        FORWARD_TOOL_NAME,
+        "Forward this conversation to another agent in the mesh (by name) or \
+         to an external service when you cannot answer the user's question",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Name of the mesh peer agent to forward to. \
+                     Omit to use the default forwarding endpoint."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this conversation is being forwarded."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "What to ask the forwarded service."
+                }
+            },
+            "required": ["reason", "summary"]
+        }),
+    )
+}
+
 /// The POST body sent to the forwarding endpoint.
 #[derive(Debug, Serialize)]
 struct ForwardRequest<'a> {
@@ -134,7 +168,25 @@ async fn forward_with(
 /// Parses the `{"reason": "...", "summary": "..."}` arguments the model
 /// emits for a `forward_call`. Missing fields default to the empty string.
 pub(crate) fn parse_forward_args(arguments: &str) -> (String, String) {
+    let (target, reason, summary) = parse_forward_args_full(arguments);
+    // The non-mesh path ignores any stray `target`; only reason/summary are
+    // forwarded to the --forward-url endpoint.
+    let _ = target;
+    (reason, summary)
+}
+
+/// Parses the mesh-extended `{"target": "...", "reason": "...",
+/// "summary": "..."}` arguments the model emits for a `forward_call`.
+/// `target` is `None` when absent (the call then falls back to the
+/// `--forward-url` endpoint). Missing `reason`/`summary` default to the empty
+/// string.
+pub(crate) fn parse_forward_args_full(arguments: &str) -> (Option<String>, String, String) {
     let v: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+    let target = v
+        .get("target")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let reason = v
         .get("reason")
         .and_then(|x| x.as_str())
@@ -145,7 +197,7 @@ pub(crate) fn parse_forward_args(arguments: &str) -> (String, String) {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    (reason, summary)
+    (target, reason, summary)
 }
 
 /// Tool executor that forwards the conversation to an external service.

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use futures_util::StreamExt;
@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{LlmError, Result, SkadooshError};
 use crate::llm::splitter::ClauseSplitter;
+use crate::memory::MemoryStore;
+use crate::rag::{OnnxEmbedder, RagStore};
 use crate::tools::{execute_parallel, ShellExecutor, ToolExecutor};
 
 /// One content block in a multimodal message (OpenAI-compatible format).
@@ -279,9 +281,31 @@ pub struct LlmClient {
     /// registered and routed here (with the live conversation history) instead
     /// of through the subprocess executor.
     forward_tool: Option<crate::forward::ForwardTool>,
+    /// Optional WASM plugin manager (`--plugins-dir`). When `Some`, each
+    /// loaded plugin is auto-registered as a tool and its calls are routed
+    /// here — run in a wasmtime sandbox — instead of through the subprocess
+    /// executor.
+    plugin_manager: Option<crate::plugins::PluginManager>,
+    /// Optional sandboxed code-execution tool. When `Some`, a `code_exec`
+    /// tool is registered and routed here instead of through the subprocess
+    /// executor (`--code-exec-timeout`).
+    sandbox_tool: Option<Arc<crate::sandbox::SandboxExecutor>>,
+    /// Optional mesh node. When `Some` (mesh networking enabled), a
+    /// `forward_call` with a `target` peer name is routed to that peer's HTTP
+    /// endpoint via the mesh instead of the `forward_tool` endpoint.
+    mesh: Option<crate::mesh::MeshNode>,
     /// Shared flag toggled on during tool execution for hold-music ducking.
     /// When `Some`, the pipeline can play hold music while tools run.
     pub(crate) hold_music_active: Option<Arc<AtomicBool>>,
+    /// Optional conversation memory (`--memory-file`). When `Some`,
+    /// remembered user preferences were injected into the seeded system
+    /// prompt (see [`build_system_prompt`]), and each completed turn is
+    /// summarized back here (see [`Self::maybe_summarize_turn`]).
+    memory: Option<Arc<Mutex<MemoryStore>>>,
+    /// Optional RAG index (`--rag-dir`). When `Some`, the top-k chunks for
+    /// the current query are injected into the system prompt before each turn
+    /// (see [`Self::refresh_system_message`]).
+    rag: Option<RagStore>,
 }
 
 impl LlmClient {
@@ -317,7 +341,12 @@ impl LlmClient {
             max_tool_rounds: 5,
             tool_executor: None,
             forward_tool: None,
+            plugin_manager: None,
+            sandbox_tool: None,
+            mesh: None,
             hold_music_active: None,
+            memory: None,
+            rag: None,
         }
     }
 
@@ -379,6 +408,24 @@ impl LlmClient {
         self.hold_music_active.as_ref()
     }
 
+    /// Sets a mesh node, enabling `forward_call` routing to discovered peers.
+    /// When set, a `forward_call` carrying a `target` peer name is routed to
+    /// that peer's HTTP endpoint via the mesh; a call without `target` still
+    /// falls back to the `forward_tool` / `--forward-url` endpoint.
+    pub fn with_mesh(mut self, node: crate::mesh::MeshNode) -> Self {
+        self.mesh = Some(node);
+        self
+    }
+
+    /// Sets a RAG index, enabling retrieval-augmented generation: before each
+    /// turn the top-k chunks for the user query are injected into the system
+    /// prompt. `LlmClient::from_config` builds one from `--rag-dir`
+    /// automatically; this builder lets the SDK inject a prebuilt store.
+    pub fn with_rag(mut self, store: RagStore) -> Self {
+        self.rag = Some(store);
+        self
+    }
+
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
@@ -395,15 +442,57 @@ impl LlmClient {
         } else {
             None
         };
-        // When a forwarding endpoint is configured, auto-register the
-        // `forward_call` tool and build the executor that relays the
-        // conversation (with live history) to that endpoint.
+        // When mesh networking is enabled, start the node and auto-register
+        // the mesh-extended `forward_call` tool (which adds an optional
+        // `target` peer-name argument). The mesh routes targeted forwards to
+        // a peer's HTTP endpoint; calls without a target fall back to the
+        // `forward_tool` / `--forward-url` endpoint below.
+        let mesh = if config.mesh {
+            let agent_name = config
+                .agent_name
+                .clone()
+                .unwrap_or_else(|| format!("skadoosh-{}", std::process::id()));
+            tracing::info!(
+                agent = %agent_name,
+                port = config.mesh_port,
+                "mesh networking enabled"
+            );
+            tools.push(crate::forward::mesh_forward_tool_definition());
+            Some(crate::mesh::MeshNode::start(&agent_name, config.mesh_port))
+        } else {
+            None
+        };
+        // When a forwarding endpoint is configured, build the executor that
+        // relays the conversation (with live history) to that endpoint. When
+        // mesh is already enabled it registered the (richer) tool definition,
+        // so the plain one is only pushed here in the non-mesh case.
         let forward_tool = if let Some(ref url) = config.forward_url {
             tracing::info!(forward_url = %url, "call forwarding enabled");
-            tools.push(crate::forward::forward_tool_definition());
+            if mesh.is_none() {
+                tools.push(crate::forward::forward_tool_definition());
+            }
             Some(crate::forward::ForwardTool::new(
                 crate::forward::ForwardConfig::new(url.clone()),
             ))
+        } else {
+            None
+        };
+        // Sandboxed code execution (`--code-exec-timeout`): auto-register the
+        // `code_exec` tool and build the sandbox executor that runs snippets
+        // in a restricted subprocess (or Docker container) and returns stdout,
+        // stderr, and the exit code — like `--forward-url` does for
+        // `forward_call`.
+        let sandbox_tool = if let Some(secs) = config.code_exec_timeout {
+            tracing::info!(
+                timeout_secs = secs,
+                sandbox = ?config.code_exec_sandbox,
+                "code_exec tool enabled"
+            );
+            tools.push(crate::sandbox::code_exec_tool_definition());
+            Some(Arc::new(crate::sandbox::SandboxExecutor::new(
+                secs,
+                config.code_exec_sandbox,
+            )))
         } else {
             None
         };
@@ -413,17 +502,123 @@ impl LlmClient {
         } else {
             None
         };
+        // Conversation memory (`--memory-file`): open the store (auto-loads
+        // any existing file), inject remembered preferences into the system
+        // prompt, and keep the handle to summarize each completed turn.
+        let memory = if let Some(ref path) = config.memory_file {
+            tracing::info!(path = %path.display(), "conversation memory enabled");
+            Some(Arc::new(Mutex::new(MemoryStore::open(path))))
+        } else {
+            None
+        };
+        // Retrieval-augmented generation (`--rag-dir`): load and embed the docs
+        // once at startup. Best-effort — a missing model/vocab or an empty dir
+        // warns and leaves RAG off: retrieval is an enhancement, never a
+        // startup blocker. The companion vocab path is derived from the model
+        // path (`<stem>-vocab.txt`).
+        let rag = if let Some(ref dir) = config.rag_dir {
+            let model = &config.rag_model;
+            let vocab = OnnxEmbedder::companion_vocab(model);
+            if !model.is_file() || !vocab.is_file() {
+                tracing::warn!(
+                    rag_model = %model.display(),
+                    rag_vocab = %vocab.display(),
+                    "RAG enabled (--rag-dir) but the embedding model or vocab is missing; \
+                     retrieval disabled (run scripts/download_models.sh --with-rag)"
+                );
+                None
+            } else {
+                match OnnxEmbedder::load(model, &vocab, crate::rag::DEFAULT_MAX_SEQ_LEN) {
+                    Ok(embedder) => {
+                        match RagStore::build(dir, Box::new(embedder), config.rag_top_k) {
+                            Ok(store) => {
+                                tracing::info!(chunks = store.len(), "RAG index ready");
+                                Some(store)
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "RAG index build failed; retrieval disabled");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "RAG embedding model load failed; retrieval disabled"
+                        );
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        // WASM plugins (`--plugins-dir`): load each `.wasm` plugin, register
+        // its tool definition, and keep the manager so the tool-call loop can
+        // route plugin calls into the wasmtime sandbox. When `--plugins-dir`
+        // is unset, fall back to the default `~/.skadoosh/plugins/` directory
+        // only if it already exists (otherwise no plugins load, silently).
+        let plugin_manager = match config.plugins_dir.as_deref() {
+            Some(dir) => match crate::plugins::PluginManager::load_dir(dir) {
+                Ok(pm) => {
+                    let count = pm.len();
+                    tools.extend(pm.tool_definitions());
+                    tracing::info!(dir = %dir.display(), count, "WASM plugins loaded");
+                    Some(pm)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to load plugins dir; continuing without plugins"
+                    );
+                    None
+                }
+            },
+            None => crate::plugins::default_plugins_dir()
+                .filter(|dir| dir.exists())
+                .and_then(|dir| match crate::plugins::PluginManager::load_dir(&dir) {
+                    Ok(pm) => {
+                        let count = pm.len();
+                        tools.extend(pm.tool_definitions());
+                        tracing::info!(
+                            dir = %dir.display(),
+                            count,
+                            "WASM plugins loaded from default dir"
+                        );
+                        Some(pm)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            error = %e,
+                            "failed to load default plugins dir"
+                        );
+                        None
+                    }
+                }),
+        };
+        let system_prompt = build_system_prompt(
+            &config.system_prompt,
+            config.agent_name.as_deref(),
+            memory.as_deref(),
+        );
         Self {
             image_paths: config.images.clone(),
             tools,
             max_tool_rounds: config.max_tool_rounds,
             tool_executor,
             forward_tool,
+            plugin_manager,
+            sandbox_tool,
+            mesh,
             hold_music_active,
+            memory,
+            rag,
             ..Self::new(
                 &config.llm_url,
                 &config.llm_model,
-                &config.system_prompt,
+                &system_prompt,
                 config.max_history_turns,
                 config.api_key.clone(),
             )
@@ -483,7 +678,10 @@ impl LlmClient {
             tool_call_id: None,
             tool_calls: None,
         });
-        let result = self.stream_reply_inner(&clauses, &cancel).await;
+        // RAG: inject the top-k chunks for this query into the system message
+        // before the request is sent (no-op when `--rag-dir` is unset).
+        self.refresh_system_message(user);
+        let result = self.stream_reply_inner(user, &clauses, &cancel).await;
         if matches!(result, Err(SkadooshError::Llm(LlmError::Cancelled))) {
             self.truncate_history();
         }
@@ -495,6 +693,7 @@ impl LlmClient {
     /// no matter which `select!` observed the token.
     async fn stream_reply_inner(
         &mut self,
+        user: &str,
         clauses: &mpsc::Sender<String>,
         cancel: &CancellationToken,
     ) -> Result<()> {
@@ -616,6 +815,7 @@ impl LlmClient {
 
             // No tool calls → turn complete.
             if tool_calls.is_empty() {
+                self.maybe_summarize_turn(user, &round_reply);
                 self.history.push(Message {
                     role: "assistant".to_string(),
                     content: MessageContent::Text(round_reply),
@@ -664,7 +864,11 @@ impl LlmClient {
 
             // Tool result messages: run calls via the configured executor.
             // When multiple calls are present, execute them in parallel.
-            let has_executor = self.tool_executor.is_some() || self.forward_tool.is_some();
+            let has_executor = self.tool_executor.is_some()
+                || self.forward_tool.is_some()
+                || self.mesh.is_some()
+                || self.sandbox_tool.is_some()
+                || self.plugin_manager.is_some();
             if has_executor {
                 // Collect configured tool names for validation — rejects
                 // tool calls the model hallucinates that weren't defined.
@@ -701,21 +905,42 @@ impl LlmClient {
                 let mut results: BTreeMap<String, std::result::Result<String, SkadooshError>> =
                     BTreeMap::new();
 
-                // Route `forward_call` to the ForwardTool, passing the live
-                // conversation history so the forwarded service gets full
-                // context. Unknown tool names are warned and skipped below.
-                if let Some(ref forward) = self.forward_tool {
+                // Route `forward_call`: when a peer `target` is present and
+                // the mesh is enabled, route to that peer's HTTP endpoint;
+                // otherwise fall back to the ForwardTool (--forward-url
+                // endpoint). The live conversation history is forwarded in
+                // both cases so the recipient gets full context. Unknown tool
+                // names are warned and skipped below.
+                let mesh = self.mesh.as_ref();
+                if self.forward_tool.is_some() || mesh.is_some() {
                     let current_query = last_user_text(&self.history);
                     let mut forwarded = 0usize;
                     for (name, args, call_id) in &batch {
                         if name == crate::forward::FORWARD_TOOL_NAME
                             && known.contains(name.as_str())
                         {
+                            let (target, reason, summary) =
+                                crate::forward::parse_forward_args_full(args);
+                            let res = if let (Some(target), Some(mesh)) = (&target, mesh) {
+                                mesh.forward_to_peer(
+                                    target,
+                                    &self.history,
+                                    &current_query,
+                                    &reason,
+                                    &summary,
+                                )
+                                .await
+                            } else if let Some(ref forward) = self.forward_tool {
+                                forward
+                                    .forward(&self.history, &current_query, &reason, &summary)
+                                    .await
+                            } else {
+                                Err(SkadooshError::Other(anyhow::anyhow!(
+                                    "forward_call set target {target:?} but mesh is not enabled \
+                                     and no --forward-url endpoint is configured"
+                                )))
+                            };
                             forwarded += 1;
-                            let (reason, summary) = crate::forward::parse_forward_args(args);
-                            let res = forward
-                                .forward(&self.history, &current_query, &reason, &summary)
-                                .await;
                             if let Err(ref e) = res {
                                 tracing::warn!(tool = %name, error = %e, "forward call failed");
                             }
@@ -723,7 +948,59 @@ impl LlmClient {
                         }
                     }
                     if forwarded > 0 {
-                        tracing::info!(count = forwarded, "forwarded calls to external service");
+                        tracing::info!(count = forwarded, "forwarded calls");
+                    }
+                }
+
+                // Route `code_exec` to the SandboxExecutor (parallel via tokio
+                // tasks, mirroring the shell executor below). The sandbox
+                // returns stdout/stderr/exit_code as JSON.
+                if let Some(ref sandbox) = self.sandbox_tool {
+                    let mut sandboxed = 0usize;
+                    let mut handles = Vec::new();
+                    for (name, args, call_id) in &batch {
+                        if name == crate::sandbox::CODE_EXEC_TOOL_NAME
+                            && known.contains(name.as_str())
+                        {
+                            sandboxed += 1;
+                            let sb = Arc::clone(sandbox);
+                            let (n, a, cid) = (name.clone(), args.clone(), call_id.clone());
+                            handles.push(tokio::spawn(async move { (cid, sb.execute(&n, &a)) }));
+                        }
+                    }
+                    for h in handles {
+                        match h.await {
+                            Ok((cid, r)) => {
+                                results.insert(cid, r);
+                            }
+                            Err(e) => tracing::error!(error = %e, "code_exec task panicked"),
+                        }
+                    }
+                    if sandboxed > 0 {
+                        tracing::info!(count = sandboxed, "executed code_exec calls in sandbox");
+                    }
+                }
+
+                // Route plugin tool calls into the wasmtime sandbox via the
+                // PluginManager. Each plugin's tool definition was registered in
+                // `from_config`; the model's JSON arguments are passed verbatim
+                // as the plugin's `input_json`. Runs inline (plugins are
+                // CPU-bounded by the fuel budget), mirroring the forward
+                // routing above.
+                if let Some(ref plugins) = self.plugin_manager {
+                    let mut ran = 0usize;
+                    for (name, args, call_id) in &batch {
+                        if plugins.has(name) && known.contains(name.as_str()) {
+                            ran += 1;
+                            let res = plugins.execute(name, args);
+                            if let Err(ref e) = res {
+                                tracing::warn!(tool = %name, error = %e, "plugin execution failed");
+                            }
+                            results.insert(call_id.clone(), res);
+                        }
+                    }
+                    if ran > 0 {
+                        tracing::info!(count = ran, "plugin tool calls executed");
                     }
                 }
 
@@ -732,7 +1009,10 @@ impl LlmClient {
                 let shell_batch: Vec<(String, String, String)> = batch
                     .iter()
                     .filter(|(name, _, _)| {
-                        if name == crate::forward::FORWARD_TOOL_NAME {
+                        if name == crate::forward::FORWARD_TOOL_NAME
+                            || name == crate::sandbox::CODE_EXEC_TOOL_NAME
+                            || self.plugin_manager.as_ref().is_some_and(|p| p.has(name))
+                        {
                             false
                         } else if known.contains(name.as_str()) {
                             true
@@ -808,6 +1088,7 @@ impl LlmClient {
         }
 
         // Max rounds exhausted: record whatever text we got.
+        self.maybe_summarize_turn(user, &total_reply);
         self.history.push(Message {
             role: "assistant".to_string(),
             content: MessageContent::Text(total_reply),
@@ -847,6 +1128,55 @@ impl LlmClient {
             self.history.drain(1..=drop);
         }
     }
+
+    /// When RAG is enabled, rewrites the seeded system message
+    /// (`history[0]`) to carry the top-k retrieved chunks for `query`,
+    /// formatted as
+    /// `"{system_prompt}\n\nRelevant context:\n{chunks}\n\nAnswer using this
+    /// context if helpful."`. With no chunks (empty index or query-embedding
+    /// failure) the base system prompt is restored, so a prior turn's context
+    /// never leaks into the next. No-op when RAG is disabled.
+    fn refresh_system_message(&mut self, query: &str) {
+        // Borrow only `rag` here; the borrow ends before we touch `history`.
+        let rag_context = if let Some(rag) = self.rag.as_mut() {
+            let top_k = rag.top_k;
+            let chunks = rag.search(query, top_k);
+            if chunks.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "Relevant context:\n{}\n\nAnswer using this context if helpful.",
+                    chunks.join("\n")
+                ))
+            }
+        } else {
+            None
+        };
+
+        // Only rewrite the system message when RAG is configured, so non-RAG
+        // clients pay nothing and `history[0]` is left untouched.
+        if self.rag.is_some() {
+            if let Some(msg) = self.history.first_mut() {
+                let content = match rag_context {
+                    Some(ctx) => format!("{}\n\n{}", self.system_prompt, ctx),
+                    None => self.system_prompt.clone(),
+                };
+                msg.content = MessageContent::Text(content);
+            }
+        }
+    }
+
+    /// If conversation memory is configured, appends a summary of this turn
+    /// (`user` → `reply`) to the store (which auto-saves). Best-effort: a
+    /// poisoned mutex is warned, not fatal, so memory can never break a turn.
+    fn maybe_summarize_turn(&self, user: &str, reply: &str) {
+        if let Some(memory) = &self.memory {
+            match memory.lock() {
+                Ok(mut store) => store.summarize_turn(user, reply),
+                Err(err) => tracing::warn!(error = %err, "memory lock poisoned; turn not saved"),
+            }
+        }
+    }
 }
 
 /// Returns the text of the most recent `user` message in `history`, or the
@@ -860,6 +1190,36 @@ fn last_user_text(history: &[Message]) -> String {
         .and_then(|m| m.content.as_text())
         .unwrap_or("")
         .to_string()
+}
+
+/// Builds the effective system prompt from the configured base:
+///
+/// * when `agent_name` is set (`--agent-name`), it is prefixed with
+///   `"You are {name}, a helpful voice assistant. "`; and
+/// * when a memory store is configured (`--memory-file`), any remembered
+///   preferences are appended as
+///   `"The user previously mentioned: {key: value; …}"`.
+///
+/// Both are best-effort: a missing name or memory leaves the base prompt
+/// untouched.
+fn build_system_prompt(
+    base: &str,
+    agent_name: Option<&str>,
+    memory: Option<&Mutex<MemoryStore>>,
+) -> String {
+    let mut prompt = match agent_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("You are {name}, a helpful voice assistant. {base}"),
+        None => base.to_string(),
+    };
+    if let Some(memory) = memory {
+        if let Ok(store) = memory.lock() {
+            if let Some(prefs) = store.preferences_summary() {
+                prompt.push_str("\nThe user previously mentioned: ");
+                prompt.push_str(&prefs);
+            }
+        }
+    }
+    prompt
 }
 
 /// Passes a success response through; a non-success status becomes
@@ -1044,5 +1404,44 @@ mod tests {
             "forward_call must not be registered without --forward-url: {bare_names:?}"
         );
         assert!(bare.forward_tool.is_none());
+    }
+
+    /// `from_config` auto-registers the `code_exec` tool definition and a
+    /// [`crate::sandbox::SandboxExecutor`] when `code_exec_timeout` is set,
+    /// and registers neither when it is unset.
+    #[test]
+    fn from_config_registers_code_exec_when_timeout_set() {
+        let config = Config {
+            code_exec_timeout: Some(30),
+            ..Default::default()
+        };
+
+        let client = LlmClient::from_config(&config);
+        let names: Vec<&str> = client
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&crate::sandbox::CODE_EXEC_TOOL_NAME),
+            "code_exec tool must be registered: {names:?}"
+        );
+        assert!(
+            client.sandbox_tool.is_some(),
+            "SandboxExecutor must be wired when --code-exec-timeout is set"
+        );
+
+        // Without code_exec_timeout, neither the tool nor the executor is present.
+        let bare = LlmClient::from_config(&Config::default());
+        let bare_names: Vec<&str> = bare
+            .tools
+            .iter()
+            .map(|t| t.function.name.as_str())
+            .collect();
+        assert!(
+            !bare_names.contains(&crate::sandbox::CODE_EXEC_TOOL_NAME),
+            "code_exec must not be registered without --code-exec-timeout: {bare_names:?}"
+        );
+        assert!(bare.sandbox_tool.is_none());
     }
 }

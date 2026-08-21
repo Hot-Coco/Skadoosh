@@ -10,22 +10,32 @@
 #   models/kokoro-v0_19.onnx    Kokoro-82M fp32 (~310 MB) — thewh1teagle/kokoro-onnx, release "model-files"
 #   models/voices.bin           Kokoro voice style bank (~5.5 MB, 2D [n,256] f32 npy) — same release
 #
+# With --with-rag (opt-in, ~90 MB) — enables retrieval-augmented generation
+# (`--rag-dir`):
+#
+#   models/all-MiniLM-L6-v2.onnx          all-MiniLM-L6-v2 sentence embedder (~90 MB)
+#       — sentence-transformers/all-MiniLM-L6-v2, onnx/model.onnx
+#   models/all-MiniLM-L6-v2-vocab.txt     BERT uncased WordPiece vocab (~231 KB)
+#       — same repo, vocab.txt
+#
 # The script is idempotent: existing files at or above their expected minimum
 # size are skipped; undersized files are re-downloaded; downloads that end up
-# too small fail loudly. All URLs verified 2026-08-18.
+# too small fail loudly. RAG URLs verified 2026-08-21; others 2026-08-18.
 
 set -euo pipefail
 
 WITH_KOKORO=0
+WITH_RAG=0
 for arg in "$@"; do
     case "$arg" in
         --with-kokoro) WITH_KOKORO=1 ;;
+        --with-rag) WITH_RAG=1 ;;
         -h | --help)
-            echo "usage: $0 [--with-kokoro]" >&2
+            echo "usage: $0 [--with-kokoro] [--with-rag]" >&2
             exit 0
             ;;
         *)
-            echo "unknown argument: $arg (usage: $0 [--with-kokoro])" >&2
+            echo "unknown argument: $arg (usage: $0 [--with-kokoro] [--with-rag])" >&2
             exit 2
             ;;
     esac
@@ -101,6 +111,21 @@ if ((WITH_KOKORO)); then
         "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin" \
         "$MODELS_DIR/voices.bin" \
         1000000
+fi
+
+if ((WITH_RAG)); then
+    # all-MiniLM-L6-v2 sentence embedder for --rag-dir. The ONNX export
+    # outputs last_hidden_state [B,S,384] (mean-pooled in Rust); the vocab is
+    # the standard BERT uncased WordPiece list (30522 tokens).
+    download \
+        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx" \
+        "$MODELS_DIR/all-MiniLM-L6-v2.onnx" \
+        90000000
+
+    download \
+        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/vocab.txt" \
+        "$MODELS_DIR/all-MiniLM-L6-v2-vocab.txt" \
+        200000
 fi
 
 echo "done."

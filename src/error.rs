@@ -95,6 +95,21 @@ pub enum TtsError {
     MissingVoices(String),
 }
 
+/// RAG (retrieval-augmented generation) failures: embedding model loading,
+/// inference, and document ingestion.
+#[derive(Debug, Error)]
+pub enum RagError {
+    /// The embedding ONNX model or its vocab could not be loaded.
+    #[error("failed to load RAG embedding model: {0}")]
+    ModelLoad(String),
+    /// An `ort` embedding inference call failed.
+    #[error("RAG inference failed: {0}")]
+    Inference(String),
+    /// Reading or walking the `--rag-dir` document directory failed.
+    #[error("RAG document loading failed: {0}")]
+    Io(String),
+}
+
 /// Crate-wide umbrella error; every stage error converts into it.
 #[derive(Debug, Error)]
 pub enum SkadooshError {
@@ -113,6 +128,9 @@ pub enum SkadooshError {
     /// TTS stage failure.
     #[error(transparent)]
     Tts(#[from] TtsError),
+    /// RAG stage failure.
+    #[error(transparent)]
+    Rag(#[from] RagError),
     /// Escape hatch for errors at task boundaries (I/O, wav decoding, ...).
     #[error(transparent)]
     Other(#[from] anyhow::Error),

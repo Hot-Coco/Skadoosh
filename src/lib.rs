@@ -32,18 +32,26 @@ pub mod error;
 pub mod forward;
 pub(crate) mod gpu;
 pub mod llm;
+pub mod memory;
+pub mod mesh;
 #[cfg(feature = "audio")]
 pub mod pipeline;
+pub mod plugins;
+pub mod rag;
+pub mod sandbox;
 pub mod stt;
 pub mod tools;
 pub mod tts;
 #[cfg(feature = "audio")]
 pub mod vad;
+pub mod watch;
 pub(crate) mod wav;
 
 pub use agent::{Agent, AgentBuilder, AgentEvent};
 pub use config::{Config, OutputMode};
 pub use error::{Result, SkadooshError};
+pub use memory::MemoryStore;
 #[cfg(feature = "audio")]
 pub use pipeline::{Pipeline, SelftestReport};
+pub use plugins::{LoadedPlugin, PluginManager, PluginManifest};
 pub use tts::TtsEngine;

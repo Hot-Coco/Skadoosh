@@ -78,6 +78,9 @@ Every flag has a `SKADOOSH_` env var. `--api-key` is never logged.
 | `--whisper-model-size` | `tiny` | Whisper model size for API backends |
 | `--hold-music` | off | Chord progression during tool execution |
 | `--tts-emotion` | off | Emotion-aware speech speed |
+| `--rag-dir` | — | Directory of `.txt`/`.md` docs to index for retrieval |
+| `--rag-top-k` | `3` | Chunks injected into the prompt per query |
+| `--rag-model` | `models/all-MiniLM-L6-v2.onnx` | Sentence-embedding ONNX model (`--with-rag` fetches it) |
 | `--selftest <wav>` | — | Headless end-to-end test |
 
 ## License

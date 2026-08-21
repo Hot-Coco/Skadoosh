@@ -70,6 +70,7 @@ use crate::llm::{parse_sse_line, ClauseSplitter, LlmBackend, LlmClient};
 use crate::stt::{SttConfig, SttEngine, WhisperStt};
 use crate::tts::{build_engine, concat_clip_samples, TtsClip, TtsEngine, TTS_SAMPLE_RATE};
 use crate::vad::{SileroVad, VadEvent, VadSegmenter, FRAME_LEN};
+use crate::watch::{WatchConfig, WatchEvent, WatchManager};
 use crate::wav::write_wav16;
 
 /// VAD-events channel capacity (§7).
@@ -260,7 +261,7 @@ impl Pipeline {
             }
             None => Box::new(LlmClient::from_config(&config)),
         };
-        let tts = match (tts, config.output) {
+        let mut tts = match (tts, config.output) {
             (Some(tts), OutputMode::Audio) => {
                 info!(engine = "injected", "using injected TTS engine");
                 Some(tts)
@@ -272,6 +273,31 @@ impl Pipeline {
             (None, OutputMode::Audio) => Some(build_engine(&config)?),
             (None, OutputMode::Text) => None,
         };
+
+        // Optional agent greeting (`--agent-name`): speak — or, in text mode,
+        // print — a one-line greeting before the listening loop begins. Audio
+        // mode synthesizes it on the already-open output device; text mode
+        // has no TTS, so the greeting surfaces as a printed clause instead.
+        if let Some(name) = config
+            .agent_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            let text = crate::agent::greeting_text(name);
+            match (tts.as_mut(), playback.as_ref()) {
+                (Some(engine), Some((_, handle))) => {
+                    if let Err(err) = crate::agent::speak_text(&mut **engine, handle.clone(), &text)
+                    {
+                        warn!(error = %err, "agent greeting synthesis failed");
+                    }
+                }
+                _ => {
+                    let _ = events.send(AgentEvent::Clause(text));
+                    let _ = events.send(AgentEvent::ReplyDone);
+                }
+            }
+        }
 
         match (config.output, playback) {
             (OutputMode::Audio, Some((playback, handle))) => {
@@ -362,6 +388,20 @@ fn run_loop<C: ClipSink>(
             )
         };
         let hold_music_flag = llm.hold_music_flag().cloned();
+        // Proactive triggers (`--watch-*`): spawn the background watchers and
+        // feed their events into the orchestrator. Held across the run so the
+        // watcher tasks stay alive; joined after the orchestrator exits.
+        let watch_config = WatchConfig {
+            files: config.watch_files.clone(),
+            processes: config.watch_processes.clone(),
+            timers: config.watch_timers.clone(),
+        };
+        let (watch_manager, watch_rx) = if watch_config.is_empty() {
+            (None, None)
+        } else {
+            let (manager, rx) = WatchManager::start(&watch_config, shutdown.clone());
+            (Some(manager), Some(rx))
+        };
         let result = run_orchestrator(Topology {
             vad_events: vad_rx,
             fatal_tx,
@@ -374,8 +414,14 @@ fn run_loop<C: ClipSink>(
             events,
             wake_word: config.wake_word.clone(),
             hold_music: hold_music_flag,
+            watch_rx,
         })
         .await;
+        // The orchestrator cancelled the shutdown token on its way out, so the
+        // watcher tasks are already exiting; join them.
+        if let Some(manager) = watch_manager {
+            manager.shutdown().await;
+        }
         // The orchestrator cancelled the shutdown token on its way out,
         // so the VAD task is already exiting; collect it.
         match vad_join.await {
@@ -492,6 +538,9 @@ pub struct Topology<C: ClipSink> {
     /// Hold-music active flag: shared between the LLM client (which toggles
     /// it during tool execution) and the hold-music feeder task.
     pub hold_music: Option<Arc<AtomicBool>>,
+    /// Proactive-trigger events (`--watch-*`), or `None` when no triggers are
+    /// configured. Each event is synthesized into a system-injected user turn.
+    pub watch_rx: Option<mpsc::Receiver<WatchEvent>>,
 }
 
 /// A segment forwarded by the orchestrator to the STT bridge.
@@ -1279,6 +1328,7 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
         events,
         wake_word,
         hold_music: hold_music_flag,
+        mut watch_rx,
     } = topology;
 
     let current_turn = Arc::new(AtomicU64::new(0));
@@ -1286,6 +1336,9 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
     let (text_tx, text_rx) = mpsc::channel(TEXT_CAP);
     let (turn_tx, turn_rx) = mpsc::channel(TURN_CAP);
     let (turn_done_tx, mut turn_done_rx) = mpsc::channel(TURN_DONE_CAP);
+    // Clone kept by the orchestrator to inject watch events straight into the
+    // LLM task (as system-injected user turns), bypassing STT.
+    let watch_text_tx = text_tx.clone();
 
     let ctx = StageCtx {
         current_turn,
@@ -1324,6 +1377,9 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
 
     let mut active_turn: Option<ActiveTurn> = None;
     let mut fatal: Option<SkadooshError> = None;
+    // Latches closed once the watch channel closes (all watchers done) so the
+    // watch select branch stops firing — avoiding a busy loop on `recv` None.
+    let watch_done = AtomicBool::new(false);
 
     // The topology is up; the agent is waiting for speech.
     emit(&events, AgentEvent::Listening);
@@ -1448,6 +1504,71 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
                     }
                 }
             }
+            ev = async {
+                if watch_done.load(Ordering::Relaxed) {
+                    std::future::pending::<Option<WatchEvent>>().await
+                } else {
+                    match watch_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<WatchEvent>>().await,
+                    }
+                }
+            } => {
+                match ev {
+                    Some(event) => {
+                        // Treat the trigger like a user-initiated turn:
+                        // supersede any in-flight turn, mint a fresh one, and
+                        // inject the notification straight into the LLM task
+                        // (bypassing STT — the text is already known). The LLM
+                        // task emits the Transcript event, so the notification
+                        // surfaces like any other user utterance.
+                        if let Some(turn) = active_turn.take() {
+                            debug!(
+                                turn_id = turn.turn_id,
+                                llm_done = turn.llm_done,
+                                "superseding in-flight turn for watch event"
+                            );
+                            turn.token.cancel();
+                        }
+                        let turn_id = current_turn.fetch_add(1, Ordering::SeqCst) + 1;
+                        let token = shutdown.child_token();
+                        active_turn = Some(ActiveTurn {
+                            turn_id,
+                            token: token.clone(),
+                            llm_done: false,
+                        });
+                        let text = format!("NOTIFICATION: {}", event.message());
+                        info!(turn_id, %text, "watch event injected as user turn");
+                        let msg = TextMsg {
+                            turn_id,
+                            token,
+                            text,
+                            t_speech_end: Instant::now(),
+                            t_text: Instant::now(),
+                        };
+                        let sent = tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break,
+                            sent = watch_text_tx.send(msg) => sent,
+                        };
+                        if sent.is_err() {
+                            if shutdown.is_cancelled() {
+                                break;
+                            }
+                            fatal = Some(
+                                anyhow::anyhow!("LLM task channel closed unexpectedly").into(),
+                            );
+                            break;
+                        }
+                    }
+                    None => {
+                        // Watch channel closed (all watchers finished); latch
+                        // so this branch stops firing instead of busy-looping
+                        // on repeated `recv` None.
+                        watch_done.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
         }
     }
 
@@ -1460,6 +1581,7 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
     }
     drop(segment_tx);
     drop(fatal_tx);
+    drop(watch_text_tx);
     while let Some(joined) = tasks.join_next().await {
         if let Err(join_err) = joined {
             warn!(error = %join_err, "pipeline task panicked");

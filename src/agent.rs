@@ -662,3 +662,44 @@ where
 fn repl_io_error(err: std::io::Error) -> crate::error::SkadooshError {
     anyhow::anyhow!("repl I/O failed: {err}").into()
 }
+
+/// The spoken greeting the agent uses on first [`Agent::run`] (behind the
+/// `audio` feature) when `--agent-name` is set:
+/// `"Hi, I'm {name}. What's your name?"`. Returns an empty string when
+/// `agent_name` is empty or whitespace (no name configured → no greeting),
+/// so callers can gate on the result.
+pub fn greeting_text(agent_name: &str) -> String {
+    let name = agent_name.trim();
+    if name.is_empty() {
+        String::new()
+    } else {
+        format!("Hi, I'm {name}. What's your name?")
+    }
+}
+
+/// Synthesizes `text` clause-by-clause and plays it through `handle`,
+/// blocking until every clip has played (a graceful drain, like
+/// [`Agent::say`]). Used by the pipeline to speak the startup greeting on
+/// the already-open output device before the listening loop begins.
+#[cfg(feature = "audio")]
+pub(crate) fn speak_text(
+    engine: &mut dyn TtsEngine,
+    handle: PlaybackHandle,
+    text: &str,
+) -> Result<()> {
+    let mut splitter = ClauseSplitter::new(CLAUSE_MIN_LEN, CLAUSE_MAX_LEN);
+    let mut clips = Vec::new();
+    for clause in splitter.push(text).into_iter().chain(splitter.flush()) {
+        clips.push(engine.synthesize(&clause)?);
+    }
+    if clips.is_empty() {
+        return Err(anyhow::anyhow!("the text produced no speakable clauses").into());
+    }
+    run_scoped(move || async move {
+        for clip in clips {
+            handle.queue_clip(clip).await?;
+        }
+        handle.wait_drained().await;
+        Ok(())
+    })
+}

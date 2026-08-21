@@ -75,6 +75,7 @@ fn spawn_with_hold_music(flag: Arc<AtomicBool>, playing_initially: bool) -> Hold
         events,
         wake_word: None,
         hold_music: Some(flag),
+        watch_rx: None,
     }));
 
     (clips_rx, vad_tx, shutdown, join)
