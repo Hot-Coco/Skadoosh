@@ -18,3 +18,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

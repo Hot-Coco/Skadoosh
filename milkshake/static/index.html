@@ -183,9 +183,21 @@ async function send(){
           if(j.message?.content){
             full += j.message.content;
             msgDiv.innerHTML = `<div class="role">${model}</div>${escapeHtml(full)}`;
-            document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+            scrollDown();
+          }
+          if(j.message?.tool_calls){
+            j.message.tool_calls.forEach(tc => {
+              const fn = tc.function||tc;
+              addMessage('tool','🔧 **'+escapeHtml(fn.name)+'** '+escapeHtml(JSON.stringify(fn.arguments||{})).slice(0,200),'tool');
+            });
           }
         }catch(e){}
+      }
+    }
+    // After streaming finishes, the backend may have done tool-calling rounds.
+    // The final full content from the last chunk is what counts.
+    if(!full)msgDiv.innerHTML = `<div class="role">${model}</div>(empty response)`;
+    messages.push({role:'assistant',content:full||'(empty)'});
       }
     }
     if(!full)msgDiv.innerHTML = `<div class="role">${model}</div>(empty response)`;
@@ -247,6 +259,11 @@ function resetChat(){
   messages=[];
   document.getElementById('messages').innerHTML = `<div class="empty" id="welcome">
     <h2>🥤 Milkshake</h2><p>Ask anything. StealthyLM is listening.</p></div>`;
+}
+
+function scrollDown(){
+  const m = document.getElementById('messages');
+  m.scrollTop = m.scrollHeight;
 }
 
 function escapeHtml(s){
