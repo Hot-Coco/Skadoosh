@@ -78,6 +78,9 @@ fn base_config(llm_url: String) -> Config {
         tts_speed: 1.0,
         wake_word: None,
         push_to_talk: false,
+        hold_music: false,
+        whisper_model_size: "tiny".to_string(),
+        tts_emotion: false,
     }
 }
 
@@ -188,6 +191,7 @@ fn spawn_orchestrator_full(
         shutdown: shutdown.clone(),
         events,
         wake_word: None,
+        hold_music: None,
     }));
     Harness {
         vad_tx,
@@ -774,6 +778,7 @@ async fn output_text_voice_turn_streams_reply_events() {
                 shutdown: shutdown.clone(),
                 events: events_tx,
                 wake_word: None,
+                hold_music: None,
             }));
 
             // Feed jfk.wav through the real VAD, like the VAD task would.

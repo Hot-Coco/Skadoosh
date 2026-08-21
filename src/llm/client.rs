@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use base64::Engine;
 use futures_util::StreamExt;
@@ -17,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{LlmError, Result, SkadooshError};
 use crate::llm::splitter::ClauseSplitter;
-use crate::tools::{ShellExecutor, ToolExecutor};
+use crate::tools::{execute_parallel, ShellExecutor, ToolExecutor};
 
 /// One content block in a multimodal message (OpenAI-compatible format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +275,9 @@ pub struct LlmClient {
     /// requests. When `None`, tool calls get a placeholder "not configured"
     /// result message.
     tool_executor: Option<Box<dyn ToolExecutor>>,
+    /// Shared flag toggled on during tool execution for hold-music ducking.
+    /// When `Some`, the pipeline can play hold music while tools run.
+    pub(crate) hold_music_active: Option<Arc<AtomicBool>>,
 }
 
 impl LlmClient {
@@ -307,6 +312,7 @@ impl LlmClient {
             tools: Vec::new(),
             max_tool_rounds: 5,
             tool_executor: None,
+            hold_music_active: None,
         }
     }
 
@@ -355,6 +361,19 @@ impl LlmClient {
         self
     }
 
+    /// Sets a shared flag that is toggled `true` during tool execution
+    /// and `false` when the tool loop completes. The pipeline can use this
+    /// to play hold music while tools are running.
+    pub fn with_hold_music(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.hold_music_active = Some(flag);
+        self
+    }
+
+    /// Returns the hold-music active flag, if one was configured.
+    pub fn hold_music_flag(&self) -> Option<&Arc<AtomicBool>> {
+        self.hold_music_active.as_ref()
+    }
+
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
@@ -371,11 +390,18 @@ impl LlmClient {
         } else {
             None
         };
+        let hold_music_active = if config.hold_music {
+            tracing::info!("hold music enabled: will play during tool execution");
+            Some(Arc::new(AtomicBool::new(false)))
+        } else {
+            None
+        };
         Self {
             image_paths: config.images.clone(),
             tools,
             max_tool_rounds: config.max_tool_rounds,
             tool_executor,
+            hold_music_active,
             ..Self::new(
                 &config.llm_url,
                 &config.llm_model,
@@ -446,9 +472,9 @@ impl LlmClient {
         result
     }
 
-    /// The streaming body of [`stream_reply`](Self::stream_reply), split out
-    /// so the public method can run book-keeping (history truncation) on the
-    /// cancellation path no matter which `select!` observed the token.
+    /// The streaming body of `stream_reply`, split out so the public method
+    /// can run book-keeping (history truncation) on the cancellation path
+    /// no matter which `select!` observed the token.
     async fn stream_reply_inner(
         &mut self,
         clauses: &mpsc::Sender<String>,
@@ -584,6 +610,11 @@ impl LlmClient {
                 "tool calls received"
             );
 
+            // Signal hold music: tools are about to run.
+            if let Some(ref flag) = self.hold_music_active {
+                flag.store(true, Ordering::Relaxed);
+            }
+
             // Assistant message with tool_calls.
             self.history.push(Message {
                 role: "assistant".to_string(),
@@ -607,42 +638,82 @@ impl LlmClient {
                 let _ = clauses.send(format!("\x00TOOL:{name}:{args}")).await;
             }
 
-            // Tool result messages: run each call via the configured executor,
-            // or fall back to a placeholder when none is configured.
-            for tc in &calls {
-                let call_id = tc.id.clone().unwrap_or_else(|| "call_unknown".to_string());
-                let name = tc
-                    .function
-                    .as_ref()
-                    .and_then(|f| f.name.as_deref())
-                    .unwrap_or("");
-                let args = tc
-                    .function
-                    .as_ref()
-                    .and_then(|f| f.arguments.as_deref())
-                    .unwrap_or("{}");
-                let content = match self.tool_executor.as_ref() {
-                    Some(executor) => match executor.execute(name, args) {
-                        Ok(out) => out,
-                        Err(e) => {
+            // Tool result messages: run calls via the configured executor.
+            // When multiple calls are present, execute them in parallel.
+            if self.tool_executor.is_some() {
+                let batch: Vec<(String, String, String)> = calls
+                    .iter()
+                    .map(|tc| {
+                        let call_id = tc.id.clone().unwrap_or_else(|| "call_unknown".to_string());
+                        let name = tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.arguments.as_deref())
+                            .unwrap_or("{}")
+                            .to_string();
+                        (name, args, call_id)
+                    })
+                    .collect();
+
+                if batch.len() > 1 {
+                    tracing::info!(count = batch.len(), "executing tool calls in parallel");
+                }
+
+                let results = execute_parallel(batch).await;
+
+                // Re-assemble results in the original call order for history.
+                for tc in &calls {
+                    let call_id = tc.id.clone().unwrap_or_else(|| "call_unknown".to_string());
+                    let content = match results.get(&call_id) {
+                        Some(Ok(out)) => out.clone(),
+                        Some(Err(e)) => {
+                            let name = tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.as_deref())
+                                .unwrap_or("?");
                             tracing::warn!(tool = %name, error = %e, "tool execution failed");
-                            // serde_json::to_string yields a properly-escaped
-                            // JSON string literal, so the error body stays
-                            // valid JSON even with quotes/newlines.
                             let body = serde_json::to_string(&e.to_string())
                                 .unwrap_or_else(|_| "\"<unprintable error>\"".to_string());
                             format!("{{\"error\":{body}}}")
                         }
-                    },
-                    None => "{\"error\":\"tool execution not configured; respond with text\"}"
-                        .to_string(),
-                };
-                self.history.push(Message {
-                    role: "tool".to_string(),
-                    content: MessageContent::Text(content),
-                    tool_call_id: Some(call_id),
-                    tool_calls: None,
-                });
+                        None => {
+                            tracing::warn!(call_id = %call_id, "tool call result missing");
+                            "{\"error\":\"tool execution result missing\"}".to_string()
+                        }
+                    };
+                    self.history.push(Message {
+                        role: "tool".to_string(),
+                        content: MessageContent::Text(content),
+                        tool_call_id: Some(call_id),
+                        tool_calls: None,
+                    });
+                }
+            } else {
+                // No executor configured: placeholder results.
+                for tc in &calls {
+                    let call_id = tc.id.clone().unwrap_or_else(|| "call_unknown".to_string());
+                    self.history.push(Message {
+                        role: "tool".to_string(),
+                        content: MessageContent::Text(
+                            "{\"error\":\"tool execution not configured; respond with text\"}"
+                                .to_string(),
+                        ),
+                        tool_call_id: Some(call_id),
+                        tool_calls: None,
+                    });
+                }
+            }
+
+            // Tool execution done: clear hold music flag.
+            if let Some(ref flag) = self.hold_music_active {
+                flag.store(false, Ordering::Relaxed);
             }
         }
 

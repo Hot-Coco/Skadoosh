@@ -47,7 +47,7 @@
 
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -360,6 +360,7 @@ fn run_loop<C: ClipSink>(
                 .instrument(info_span!("vad")),
             )
         };
+        let hold_music_flag = llm.hold_music_flag().cloned();
         let result = run_orchestrator(Topology {
             vad_events: vad_rx,
             fatal_tx,
@@ -371,6 +372,7 @@ fn run_loop<C: ClipSink>(
             shutdown,
             events,
             wake_word: config.wake_word.clone(),
+            hold_music: hold_music_flag,
         })
         .await;
         // The orchestrator cancelled the shutdown token on its way out,
@@ -486,6 +488,9 @@ pub struct Topology<C: ClipSink> {
     /// Optional wake word: when set, the LLM task silently drops
     /// transcripts that do not contain this word.
     pub wake_word: Option<String>,
+    /// Hold-music active flag: shared between the LLM client (which toggles
+    /// it during tool execution) and the hold-music feeder task.
+    pub hold_music: Option<Arc<AtomicBool>>,
 }
 
 /// A segment forwarded by the orchestrator to the STT bridge.
@@ -1272,6 +1277,7 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
         shutdown,
         events,
         wake_word,
+        hold_music: hold_music_flag,
     } = topology;
 
     let current_turn = Arc::new(AtomicU64::new(0));
@@ -1296,6 +1302,22 @@ pub async fn run_orchestrator<C: ClipSink>(topology: Topology<C>) -> Result<()> 
     tasks.spawn(
         tts_task(turn_rx, tts_engine, sink.clone(), ctx.clone()).instrument(info_span!("tts")),
     );
+
+    // If hold music is enabled, spawn a feeder that generates and queues
+    // procedural music through the sink when the flag is active (during
+    // tool execution).
+    if let Some(ref hm_flag) = hold_music_flag {
+        let hm_flag = Arc::clone(hm_flag);
+        let hm_sink = sink.clone();
+        let hm_shutdown = shutdown.clone();
+        tasks.spawn(
+            async move {
+                hold_music_feeder(hm_flag, hm_sink, hm_shutdown).await;
+            }
+            .instrument(info_span!("hold-music")),
+        );
+    }
+
     // The orchestrator itself dispatches on `ctx.current_turn`.
     let current_turn = ctx.current_turn;
 
@@ -1738,4 +1760,41 @@ pub(crate) fn write_wav16(path: &Path, samples: &[f32], rate: u32) -> Result<()>
     }
     std::fs::write(path, &out)
         .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", path.display()).into())
+}
+
+/// Background task: watches the hold-music active flag and feeds
+/// procedural music through the clip sink when the flag is true (i.e.
+/// during tool execution). Polls every ~100 ms to keep latency low.
+async fn hold_music_feeder<C: ClipSink>(
+    flag: Arc<AtomicBool>,
+    sink: C,
+    shutdown: CancellationToken,
+) {
+    let mut music = crate::audio::HoldMusic::new(Arc::clone(&flag));
+    let poll_interval = std::time::Duration::from_millis(100);
+    let chunk_samples = ((TTS_SAMPLE_RATE as f64) * 0.1) as usize; // ~100 ms
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(poll_interval) => {},
+        }
+
+        if !flag.load(Ordering::Relaxed) || sink.is_playing() {
+            continue;
+        }
+
+        let samples = music.generate(chunk_samples);
+        if samples.is_empty() {
+            continue;
+        }
+
+        let clip = TtsClip {
+            samples,
+            sample_rate: TTS_SAMPLE_RATE,
+        };
+        if sink.queue_clip(clip).await.is_err() {
+            break;
+        }
+    }
 }

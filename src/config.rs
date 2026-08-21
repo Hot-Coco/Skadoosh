@@ -174,6 +174,25 @@ pub struct Config {
     /// Overrides VAD-based segmentation when enabled.
     #[arg(long, env = "SKADOOSH_PUSH_TO_TALK", default_value_t = false)]
     pub push_to_talk: bool,
+
+    /// Play procedural hold music during long tool execution or thinking gaps.
+    /// The agent auto-ducks the music when TTS begins speaking. No external
+    /// audio files needed — music is generated from sine-wave chord progressions.
+    #[arg(long, env = "SKADOOSH_HOLD_MUSIC", default_value_t = false)]
+    pub hold_music: bool,
+
+    /// Whisper model size to download/use. One of: tiny, base, small, medium.
+    /// Only affects model path construction; the actual model file must exist.
+    /// Default model is `ggml-tiny.en.bin`; `--whisper-model-size base` switches
+    /// to `ggml-base.en.bin`.
+    #[arg(long, env = "SKADOOSH_WHISPER_MODEL_SIZE", default_value = "tiny")]
+    pub whisper_model_size: String,
+
+    /// Enable emotion-aware TTS: the agent detects sentiment from the LLM
+    /// output and adjusts speaking speed (faster for excitement, slower for
+    /// calm/sad). Requires Kokoro TTS model.
+    #[arg(long, env = "SKADOOSH_TTS_EMOTION", default_value_t = false)]
+    pub tts_emotion: bool,
 }
 
 impl Default for Config {
@@ -208,6 +227,9 @@ impl Default for Config {
             tts_speed: 1.0,
             wake_word: None,
             push_to_talk: false,
+            hold_music: false,
+            whisper_model_size: "tiny".to_string(),
+            tts_emotion: false,
         }
     }
 }
@@ -247,6 +269,9 @@ impl fmt::Debug for Config {
             tts_speed,
             wake_word,
             push_to_talk,
+            hold_music,
+            whisper_model_size,
+            tts_emotion,
         } = self;
         f.debug_struct("Config")
             .field("images", images)
@@ -276,6 +301,9 @@ impl fmt::Debug for Config {
             .field("tts_speed", tts_speed)
             .field("wake_word", wake_word)
             .field("push_to_talk", push_to_talk)
+            .field("hold_music", hold_music)
+            .field("whisper_model_size", whisper_model_size)
+            .field("tts_emotion", tts_emotion)
             .finish()
     }
 }
@@ -296,6 +324,9 @@ impl Config {
     /// * Whisper/VAD model files must exist when the run uses them — i.e.
     ///   for the voice loop and `--selftest`, but not for `--repl`/`--say`
     ///   (except for `--list-devices`, which skips all checks).
+    ///   If `--whisper-model` is not explicitly set and
+    ///   `--whisper-model-size` is non-default, the whisper model path is
+    ///   adjusted to `models/ggml-{size}.en.bin`.
     /// * The `--selftest` wav must exist when given.
     /// * TTS (Kokoro or the MockTts fallback) is needed by `--say` and by
     ///   the voice loop in `--output audio` mode; `--repl` and
@@ -303,7 +334,22 @@ impl Config {
     ///   produce a warning — the pipeline falls back to MockTts (see
     ///   [`crate::tts::build_engine`]). `--say` without `--out-wav` plays to
     ///   an output device, which is checked when playback starts.
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&mut self) -> Result<()> {
+        // Apply whisper model size override when --whisper-model was not
+        // explicitly set (still at the default).
+        let default_model = PathBuf::from("models/ggml-tiny.en.bin");
+        if self.whisper_model == default_model && self.whisper_model_size != "tiny" {
+            let valid_sizes = ["tiny", "base", "small", "medium"];
+            if valid_sizes.contains(&self.whisper_model_size.as_str()) {
+                self.whisper_model =
+                    PathBuf::from(format!("models/ggml-{}.en.bin", self.whisper_model_size));
+            } else {
+                tracing::warn!(
+                    size = %self.whisper_model_size,
+                    "unknown --whisper-model-size; using default ggml-tiny.en.bin"
+                );
+            }
+        }
         if self.list_devices {
             return Ok(());
         }

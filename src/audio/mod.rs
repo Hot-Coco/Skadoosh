@@ -5,10 +5,12 @@
 //! resamples to the device rate. Real-time callbacks never allocate or lock.
 
 pub mod aec;
+pub mod hold_music;
 pub mod input;
 pub mod output;
 pub mod resample;
 
+pub use hold_music::HoldMusic;
 pub use input::{list_devices, push_block_drop_count, AudioInputConfig, MicCapture, CAPTURE_RATE};
 pub use output::{
     push_clip_blocking, AudioOutputConfig, OutputPump, Playback, PlaybackHandle, CLIP_SAMPLE_RATE,

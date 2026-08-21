@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(config: Config) -> skadoosh::Result<()> {
+fn dispatch(mut config: Config) -> skadoosh::Result<()> {
     config.validate()?;
 
     if config.list_devices {

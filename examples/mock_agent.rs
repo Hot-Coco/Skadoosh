@@ -135,6 +135,7 @@ async fn main() -> Result<()> {
         shutdown: shutdown.clone(),
         events,
         wake_word: None,
+        hold_music: None,
     }));
 
     // One scripted voice turn: a one-second "segment" (contents are ignored

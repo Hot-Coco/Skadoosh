@@ -30,7 +30,7 @@ fn from_args(args: &[&str]) -> Config {
 }
 
 /// Prints a labeled config and the outcome of `validate`.
-fn show(label: &str, config: &Config) {
+fn show(label: &str, config: &mut Config) {
     println!("=== {label} ===");
     println!("{config:#?}");
     match config.validate() {
@@ -42,7 +42,7 @@ fn show(label: &str, config: &Config) {
 fn main() -> skadoosh::Result<()> {
     // 1. --say --out-wav: one-shot TTS to a file. Needs no STT/VAD models and
     //    no LLM; with no Kokoro files configured it falls back to MockTts.
-    let say = from_args(&[
+    let mut say = from_args(&[
         "skadoosh",
         "--say",
         "Hello from a cookbook.",
@@ -50,20 +50,20 @@ fn main() -> skadoosh::Result<()> {
         "target/cookbook_10_say.wav",
         "--mock-tts",
     ]);
-    show("say mode (--say --out-wav)", &say);
+    show("say mode (--say --out-wav)", &mut say);
 
     // 2. --repl: text-only loop. No models, no TTS, no audio device.
-    let repl = from_args(&["skadoosh", "--repl", "--output", "text"]);
-    show("repl mode (--repl)", &repl);
+    let mut repl = from_args(&["skadoosh", "--repl", "--output", "text"]);
+    show("repl mode (--repl)", &mut repl);
 
     // 3. --output text: voice-in → text-out. STT/VAD models are still
     //    required (audio goes in), but no TTS is built.
     let mut text_voice = from_args(&["skadoosh", "--output", "text"]);
-    show("text-mode voice (--output text)", &text_voice);
+    show("text-mode voice (--output text)", &mut text_voice);
 
     // 4. Default: the full audio voice loop. Needs STT, VAD, and TTS.
-    let default = Config::default();
-    show("default audio voice loop", &default);
+    let mut default = Config::default();
+    show("default audio voice loop", &mut default);
 
     // Assertions on the parsed modes.
     assert!(say.say.is_some(), "say mode carries --say text");
@@ -82,9 +82,6 @@ fn main() -> skadoosh::Result<()> {
         text_voice.validate().is_err(),
         "text-mode voice still needs the STT/VAD models"
     );
-    // Quiet the "unused variable" lint while keeping the name readable.
-    let _ = &mut text_voice;
-
     println!("10_config_modes: OK");
     Ok(())
 }

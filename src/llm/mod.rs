@@ -6,6 +6,8 @@ pub mod splitter;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +52,12 @@ pub trait LlmBackend: Send {
 
     /// Resets the conversation history (see the trait-level note).
     fn clear_history(&mut self);
+
+    /// Returns the hold-music active flag, if this backend supports it.
+    /// Default implementation returns `None`.
+    fn hold_music_flag(&self) -> Option<&Arc<AtomicBool>> {
+        None
+    }
 }
 
 impl LlmBackend for LlmClient {
@@ -69,5 +77,9 @@ impl LlmBackend for LlmClient {
 
     fn clear_history(&mut self) {
         LlmClient::clear_history(self);
+    }
+
+    fn hold_music_flag(&self) -> Option<&Arc<AtomicBool>> {
+        self.hold_music_active.as_ref()
     }
 }

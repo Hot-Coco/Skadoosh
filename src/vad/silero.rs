@@ -42,7 +42,8 @@ impl SileroVad {
     /// initializes the state tensor (`[2, 1, 128]` zeros) and `sr` input.
     pub fn new(model_path: &Path) -> Result<Self> {
         let mut builder = Session::builder().map_err(|e| VadError::ModelLoad(e.to_string()))?;
-        crate::gpu::apply_gpu_ep(&mut builder);
+        crate::gpu::apply_gpu_ep(&mut builder)
+            .map_err(|e| VadError::ModelLoad(format!("GPU EP: {e}")))?;
         let session = builder
             .commit_from_file(model_path)
             .map_err(|e| VadError::ModelLoad(format!("{}: {e}", model_path.display())))?;
