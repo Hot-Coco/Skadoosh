@@ -7,6 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Disable CPU-specific instructions in whisper.cpp builds.
+  # Without this, cached binaries from an AVX-capable runner SIGILL
+  # when the cache lands on a runner that lacks those instructions.
+  WHISPER_NO_AVX: "ON"
+  WHISPER_NO_AVX2: "ON"
+  WHISPER_NO_FMA: "ON"
+  WHISPER_NO_F16C: "ON"
 
 jobs:
   test:
@@ -34,7 +41,7 @@ jobs:
             ~/.cargo/git
             target
             models
-          key: ${{ runner.os }}-skadoosh-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-skadoosh-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-skadoosh-
 
       - name: Download models and fixtures
