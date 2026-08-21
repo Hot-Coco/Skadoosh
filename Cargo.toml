@@ -33,10 +33,10 @@ load-dynamic = ["ort/load-dynamic"]
 ## * `gpu-coreml` — Apple CoreML (macOS only).
 ## * `gpu-directml` — DirectML on Windows (requires Windows SDK).
 ## * `gpu-rocm` — AMD ROCm (requires ROCm toolkit at build time).
-gpu-cuda = []
-gpu-coreml = []
-gpu-directml = []
-gpu-rocm = []
+gpu-cuda = ["ort/cuda"]
+gpu-coreml = ["ort/coreml"]
+gpu-directml = ["ort/directml"]
+gpu-rocm = ["ort/rocm"]
 
 [dependencies]
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-27"] }

@@ -4,7 +4,7 @@
 //! gate the corresponding ort execution providers. None enabled by default:
 //! ONNX Runtime falls back to CPU.
 
-use ort::session::builder::SessionBuilder;
+use ort::session::builder::{BuilderResult, SessionBuilder};
 
 /// Returns the name of the compiled-in GPU execution provider, or `None`
 /// when no GPU feature is enabled (CPU-only build).
@@ -36,7 +36,11 @@ pub fn gpu_execution_provider() -> Option<&'static str> {
 /// Feature-gated providers are loaded in priority order:
 /// CUDA → CoreML → DirectML → ROCm. Only the first enabled provider is
 /// registered; multiple concurrent GPU providers are not supported.
-pub fn apply_gpu_ep(builder: &mut SessionBuilder) -> std::result::Result<(), ort::Error> {
+///
+/// Takes the builder by value and returns it, matching the ONNX Runtime
+/// `with_execution_providers` builder pattern.
+#[allow(clippy::result_large_err)]
+pub fn apply_gpu_ep(builder: SessionBuilder) -> BuilderResult {
     #[cfg(feature = "gpu-cuda")]
     {
         tracing::info!("registering CUDAExecutionProvider");
@@ -58,8 +62,24 @@ pub fn apply_gpu_ep(builder: &mut SessionBuilder) -> std::result::Result<(), ort
         return builder.with_execution_providers([ort::ep::ROCm::default().build()]);
     }
     #[allow(unreachable_code)]
-    {
-        let _ = builder;
-        Ok(())
+    Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_build_is_cpu_only() {
+        assert!(
+            gpu_execution_provider().is_none(),
+            "no GPU execution provider should be selected by default"
+        );
+    }
+
+    #[test]
+    fn apply_gpu_ep_is_no_op_in_cpu_build() {
+        let builder = ort::session::Session::builder().expect("failed to create session builder");
+        apply_gpu_ep(builder).expect("CPU build apply_gpu_ep must return Ok");
     }
 }

@@ -521,7 +521,13 @@ impl LlmClient {
                     c = stream.next() => c,
                 };
                 match chunk {
-                    Some(Ok(bytes)) => lines.feed(&bytes),
+                    Some(Ok(bytes)) => {
+                        if !lines.feed(&bytes) {
+                            return Err(
+                                LlmError::Sse("SSE line exceeded maximum size".into()).into()
+                            );
+                        }
+                    }
                     Some(Err(e)) => return Err(LlmError::Http(e).into()),
                     None => {
                         lines.close();
@@ -641,6 +647,14 @@ impl LlmClient {
             // Tool result messages: run calls via the configured executor.
             // When multiple calls are present, execute them in parallel.
             if self.tool_executor.is_some() {
+                // Collect configured tool names for validation — rejects
+                // tool calls the model hallucinates that weren't defined.
+                let known: std::collections::HashSet<&str> = self
+                    .tools
+                    .iter()
+                    .map(|t| t.function.name.as_str())
+                    .collect();
+
                 let batch: Vec<(String, String, String)> = calls
                     .iter()
                     .map(|tc| {
@@ -665,7 +679,20 @@ impl LlmClient {
                     tracing::info!(count = batch.len(), "executing tool calls in parallel");
                 }
 
-                let results = execute_parallel(batch).await;
+                // Only execute calls whose tool name was actually configured.
+                let validated: Vec<_> = batch
+                    .into_iter()
+                    .filter(|(name, _, _)| {
+                        if known.contains(name.as_str()) {
+                            true
+                        } else {
+                            tracing::warn!(tool=%name, "rejected unknown tool call");
+                            false
+                        }
+                    })
+                    .collect();
+
+                let results = execute_parallel(validated).await;
 
                 // Re-assemble results in the original call order for history.
                 for tc in &calls {
@@ -797,6 +824,10 @@ async fn send_clause(
 /// Call [`close`](Self::close) at end of stream: afterwards [`next_line`]
 /// yields the unterminated trailing bytes once as a final line (a server
 /// that closes without a trailing `\n` loses no content), then `None`.
+/// Safety cap: a single SSE line must not exceed 1 MiB. Larger chunks from a
+/// compromised or broken server are rejected to prevent unbounded memory growth.
+const SSE_MAX_LINE_BYTES: usize = 1_048_576;
+
 #[derive(Default)]
 pub(crate) struct SseLineBuffer {
     buf: Vec<u8>,
@@ -804,9 +835,14 @@ pub(crate) struct SseLineBuffer {
 }
 
 impl SseLineBuffer {
-    /// Appends one stream chunk.
-    pub(crate) fn feed(&mut self, chunk: &[u8]) {
+    /// Appends one stream chunk. Returns `false` when the buffered data would
+    /// exceed [`SSE_MAX_LINE_BYTES`] — the caller should abort the stream.
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> bool {
+        if self.buf.len() + chunk.len() > SSE_MAX_LINE_BYTES {
+            return false;
+        }
         self.buf.extend_from_slice(chunk);
+        true
     }
 
     /// Marks end of stream; idempotent.

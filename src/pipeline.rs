@@ -850,7 +850,7 @@ async fn llm_task(
             let _ = fatal_tx.send(err).await;
             break;
         }
-        info!(turn_id, %text, "LLM turn started");
+        debug!(turn_id, %text, "LLM turn started");
         emit(&events, AgentEvent::Transcript(text.clone()));
         let result = client.stream_reply(&text, clause_tx, token).await;
         // Best effort: the orchestrator marks the turn stream-done (keeping
@@ -1568,7 +1568,11 @@ impl Pipeline {
         // that omits the trailing `\n` loses no content.
         while !done && !eof {
             match stream.next().await {
-                Some(Ok(bytes)) => lines.feed(&bytes),
+                Some(Ok(bytes)) => {
+                    if !lines.feed(&bytes) {
+                        return Err(LlmError::Sse("SSE line exceeded maximum size".into()).into());
+                    }
+                }
                 Some(Err(err)) => return Err(LlmError::Http(err).into()),
                 None => {
                     lines.close();

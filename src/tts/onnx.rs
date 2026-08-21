@@ -51,8 +51,8 @@ impl OnnxTts {
     /// memory. Deflated ZIP members are *not* supported (no zip crate dep):
     /// they yield [`TtsError::MissingVoices`].
     pub fn load(model: &Path, voices: &Path, voice: &str, speed: f32) -> Result<Self> {
-        let mut builder = Session::builder().map_err(|e| TtsError::ModelLoad(e.to_string()))?;
-        crate::gpu::apply_gpu_ep(&mut builder)
+        let builder = Session::builder().map_err(|e| TtsError::ModelLoad(e.to_string()))?;
+        let mut builder = crate::gpu::apply_gpu_ep(builder)
             .map_err(|e| TtsError::ModelLoad(format!("GPU EP: {e}")))?;
         let session = builder
             .commit_from_file(model)
