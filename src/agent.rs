@@ -663,7 +663,7 @@ fn repl_io_error(err: std::io::Error) -> crate::error::SkadooshError {
     anyhow::anyhow!("repl I/O failed: {err}").into()
 }
 
-/// The spoken greeting the agent uses on first [`Agent::run`] (behind the
+/// The spoken greeting the agent uses on first `Agent::run` (behind the
 /// `audio` feature) when `--agent-name` is set:
 /// `"Hi, I'm {name}. What's your name?"`. Returns an empty string when
 /// `agent_name` is empty or whitespace (no name configured → no greeting),
