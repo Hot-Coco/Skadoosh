@@ -100,6 +100,24 @@ impl MemoryStore {
         self.data.preferences.get(key).cloned()
     }
 
+    /// Searches preferences for `query` in both keys and values
+    /// (case-insensitive substring match). Returns matching `(key, value)`
+    /// pairs.
+    pub fn search_preferences(&self, query: &str) -> Vec<(String, String)> {
+        let q = query.to_lowercase();
+        self.data
+            .preferences
+            .iter()
+            .filter(|(k, v)| k.to_lowercase().contains(&q) || v.to_lowercase().contains(&q))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Returns the number of stored preferences.
+    pub fn preference_count(&self) -> usize {
+        self.data.preferences.len()
+    }
+
     /// Records a one-line summary of a completed turn (`user_text` in,
     /// `agent_reply` out), appends it to the rolling list, trims to the last
     /// `MAX_SUMMARIES` entries, then saves.

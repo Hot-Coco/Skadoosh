@@ -431,11 +431,11 @@ impl LlmClient {
     /// Builds the config-default client (the one shared construction used
     /// by the binary's pipeline and the SDK facade).
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
-        let mut tools = if let Some(ref path) = config.tools_file {
-            load_tools_file(path).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // Built-in tools are always available — no --tools-file needed.
+        let mut tools: Vec<Tool> = crate::tools::builtin::definitions();
+        if let Some(ref path) = config.tools_file {
+            tools.extend(load_tools_file(path).unwrap_or_default());
+        }
         // When tool definitions are configured, wire in a ShellExecutor so the
         // model's function calls actually run instead of returning a
         // placeholder result.
@@ -1022,6 +1022,39 @@ impl LlmClient {
                     }
                 }
 
+                // Route built-in tools (calculator, datetime, remember, recall).
+                // These run in-process — no subprocess, no API.
+                {
+                    let mut builtin = 0usize;
+                    for (name, args, call_id) in &batch {
+                        if !crate::tools::builtin::is_builtin(name) {
+                            continue;
+                        }
+                        // Try memory-less first (calculator, datetime).
+                        let res = crate::tools::builtin::execute(name, args);
+                        let res = if let Some(result) = res {
+                            result
+                        } else if let Some(ref mem) = self.memory {
+                            // Memory-backed (remember, recall).
+                            crate::tools::builtin::execute_with_memory(name, args, mem)
+                                .unwrap_or_else(|| {
+                                    Err(crate::error::SkadooshError::Other(anyhow::anyhow!(
+                                        "built-in tool '{name}': memory not available"
+                                    )))
+                                })
+                        } else {
+                            Err(crate::error::SkadooshError::Other(anyhow::anyhow!(
+                                "built-in tool '{name}' needs --memory-file"
+                            )))
+                        };
+                        results.insert(call_id.clone(), res);
+                        builtin += 1;
+                    }
+                    if builtin > 0 {
+                        tracing::info!(count = builtin, "built-in tool calls executed");
+                    }
+                }
+
                 // Remaining configured tool calls run as subprocesses through
                 // the existing parallel executor.
                 let shell_batch: Vec<(String, String, String)> = batch
@@ -1030,6 +1063,7 @@ impl LlmClient {
                         if name == crate::forward::FORWARD_TOOL_NAME
                             || name == crate::sandbox::CODE_EXEC_TOOL_NAME
                             || self.plugin_manager.as_ref().is_some_and(|p| p.has(name))
+                            || crate::tools::builtin::is_builtin(name)
                         {
                             false
                         } else if known.contains(name.as_str()) {

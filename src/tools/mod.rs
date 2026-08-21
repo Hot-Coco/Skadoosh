@@ -10,6 +10,8 @@
 //! Parallel execution: when the model issues multiple tool calls in one
 //! response, they run concurrently via `tokio::spawn`.
 
+pub mod builtin;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};

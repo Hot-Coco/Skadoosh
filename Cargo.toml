@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -87,6 +87,7 @@ tokio = { version = "1", features = ["full"] }
 # WAT parser used by the plugin integration test to synthesize a minimal
 # `.wasm` plugin in-memory (no toolchain needed to run the tests).
 wat = "1"
+tempfile = "3"
 
 # Keep whisper.cpp/ort-heavy dev builds usable.
 [profile.dev.package."*"]
