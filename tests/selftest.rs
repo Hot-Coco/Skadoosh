@@ -794,9 +794,7 @@ async fn output_text_voice_turn_streams_reply_events() {
                 (1_500 / 32 + 2) * skadoosh::vad::FRAME_LEN,
             ));
             let mut sent = false;
-            for chunk in feed.chunks_exact(skadoosh::vad::FRAME_LEN) {
-                let frame: &[f32; skadoosh::vad::FRAME_LEN] =
-                    chunk.try_into().expect("chunks_exact");
+            for frame in feed.as_chunks::<{ skadoosh::vad::FRAME_LEN }>().0 {
                 let prob = vad.process(frame).expect("vad inference");
                 if let Some(skadoosh::vad::VadEvent::Segment(audio)) = segmenter.push(frame, prob) {
                     vad_tx

@@ -29,10 +29,7 @@ fn load_jfk() -> Vec<f32> {
 /// silent frames (real streams keep running after the wav ends — this forces
 /// the trailing-silence endpoint close).
 fn framed(samples: &[f32], zeros: usize) -> Vec<[f32; FRAME_LEN]> {
-    let mut frames: Vec<[f32; FRAME_LEN]> = samples
-        .chunks_exact(FRAME_LEN)
-        .map(|c| <[f32; FRAME_LEN]>::try_from(c).expect("chunk is FRAME_LEN"))
-        .collect();
+    let mut frames = samples.as_chunks::<FRAME_LEN>().0.to_vec();
     frames.extend(std::iter::repeat_n([0.0; FRAME_LEN], zeros));
     frames
 }
