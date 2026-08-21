@@ -45,6 +45,7 @@ jobs:
 
       - name: Download models and fixtures
         run: ./scripts/download_models.sh
+        continue-on-error: true
 
       - name: Format
         run: cargo fmt --check
