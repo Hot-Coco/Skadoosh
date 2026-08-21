@@ -815,19 +815,19 @@ async fn send_clause(
     }
 }
 
+/// Safety cap: a single SSE line must not exceed 1 MiB. Larger chunks from a
+/// compromised or broken server are rejected to prevent unbounded memory growth.
+const SSE_MAX_LINE_BYTES: usize = 1_048_576;
+
 /// Buffers raw SSE bytes and yields complete lines. A multi-byte UTF-8 char
 /// split across stream chunks stays in the byte buffer until the
 /// terminating `\n` arrives, so lines are always valid boundaries. Shared
 /// by [`LlmClient::stream_reply`] and the pipeline's selftest, which drives
 /// the SSE stream directly.
 ///
-/// Call [`close`](Self::close) at end of stream: afterwards [`next_line`]
+/// Call [`close`](Self::close) at end of stream: afterwards [`next_line`](Self::next_line)
 /// yields the unterminated trailing bytes once as a final line (a server
 /// that closes without a trailing `\n` loses no content), then `None`.
-/// Safety cap: a single SSE line must not exceed 1 MiB. Larger chunks from a
-/// compromised or broken server are rejected to prevent unbounded memory growth.
-const SSE_MAX_LINE_BYTES: usize = 1_048_576;
-
 #[derive(Default)]
 pub(crate) struct SseLineBuffer {
     buf: Vec<u8>,
