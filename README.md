@@ -5,7 +5,7 @@
 [![CI](https://github.com/Hot-Coco/Skadoosh/actions/workflows/ci.yml/badge.svg)](https://github.com/Hot-Coco/Skadoosh/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-**A fast, fully local voice agent in Rust.** Mic in, Silero VAD listens, Whisper transcribes, your LLM replies, and Kokoro speaks each clause as it lands. Interrupt mid-sentence — it shuts up instantly. No cloud, no fuss. OpenAI-compatible backends also work.
+**A fast, fully local voice agent in Rust.** Mic in, Silero VAD listens, Whisper transcribes, your LLM replies, and Kokoro speaks each clause as it lands. Interrupt mid-sentence — it quiets instantly. No cloud, no fuss. OpenAI-compatible backends also work.
 
 Use it as a binary or as a library with pluggable engines.
 
