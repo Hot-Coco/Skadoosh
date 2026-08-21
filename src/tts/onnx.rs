@@ -373,8 +373,8 @@ fn parse_npy_f32(buf: &[u8]) -> std::result::Result<VoiceBank, TtsError> {
         )));
     }
     let mut floats = Vec::with_capacity(total);
-    for b in data[..need].chunks_exact(4) {
-        floats.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    for b in data[..need].as_chunks::<4>().0 {
+        floats.push(f32::from_le_bytes(*b));
     }
     Ok(VoiceBank { data: floats, rows })
 }

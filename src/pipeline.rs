@@ -1494,8 +1494,7 @@ impl Pipeline {
         let mut segment = None;
         let mut feed = samples;
         feed.extend(std::iter::repeat_n(0.0, silence_frames * FRAME_LEN));
-        for chunk in feed.chunks_exact(FRAME_LEN) {
-            let frame: &[f32; FRAME_LEN] = chunk.try_into().expect("chunks_exact(FRAME_LEN)");
+        for frame in feed.as_chunks::<FRAME_LEN>().0 {
             let prob = vad.process(frame)?;
             if let Some(VadEvent::Segment(audio)) = segmenter.push(frame, prob) {
                 segment = Some(audio);
