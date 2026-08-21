@@ -41,11 +41,10 @@ jobs:
             ~/.cargo/git
             target
             models
-          key: ${{ runner.os }}-skadoosh-v3-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-skadoosh-v4-${{ hashFiles('Cargo.lock') }}
 
       - name: Download models and fixtures
-        run: ./scripts/download_models.sh
-        continue-on-error: true
+        run: timeout 120 ./scripts/download_models.sh || true
 
       - name: Format
         run: cargo fmt --check
