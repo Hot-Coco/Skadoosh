@@ -7,7 +7,10 @@
 //! Point the agent at any OpenAI-compatible server — local Ollama:
 //!
 //! ```sh
-//! ollama pull qwen2.5:0.5b
+//! # download + register the default model (one-time):
+//! wget https://huggingface.co/StealthyML/StealthyLM-Emotive/resolve/main/StealthyLM_Q4KM.gguf
+//! echo 'FROM ./StealthyLM_Q4KM.gguf' > Modelfile
+//! ollama create stealthylm -f Modelfile
 //! cargo run --example text_chat
 //! ```
 //!
@@ -17,7 +20,7 @@
 //! exactly this file's [`chat`] function against the mock.
 //!
 //! Environment: `SKADOOSH_LLM_URL` (default `http://localhost:11434/v1`),
-//! `SKADOOSH_LLM_MODEL` (default `qwen2.5:0.5b`), `SKADOOSH_API_KEY`
+//! `SKADOOSH_LLM_MODEL` (default `stealthylm`), `SKADOOSH_API_KEY`
 //! (optional bearer token for hosted providers).
 
 use skadoosh::{Agent, AgentEvent, Config, OutputMode, Result};

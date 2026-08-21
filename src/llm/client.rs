@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::DEFAULT_SYSTEM_PROMPT;
 use crate::error::{LlmError, Result, SkadooshError};
+use crate::llm::model;
 use crate::llm::splitter::ClauseSplitter;
 use crate::memory::MemoryStore;
 use crate::rag::{OnnxEmbedder, RagStore};
@@ -598,11 +600,27 @@ impl LlmClient {
                     }
                 }),
         };
-        let system_prompt = build_system_prompt(
-            &config.system_prompt,
-            config.agent_name.as_deref(),
-            memory.as_deref(),
-        );
+        // Model registry: when the configured model is known and the user
+        // hasn't explicitly overridden the system prompt, use the model's
+        // own prompt. An explicit `--system-prompt` always wins.
+        let known = model::find_model(&config.llm_model);
+        let base_prompt = if config.system_prompt == DEFAULT_SYSTEM_PROMPT {
+            known
+                .and_then(|m| m.system_prompt)
+                .unwrap_or(&config.system_prompt)
+        } else {
+            &config.system_prompt
+        };
+        let system_prompt =
+            build_system_prompt(base_prompt, config.agent_name.as_deref(), memory.as_deref());
+        // When the model is emotion-aware but the user hasn't enabled
+        // --tts-emotion, suggest it (StealthyLM-Emotive pairs with it).
+        if model::is_emotion_aware(&config.llm_model) && !config.tts_emotion {
+            tracing::info!(
+                "model '{}' is emotion-aware — try --tts-emotion for expressive speech",
+                config.llm_model
+            );
+        }
         Self {
             image_paths: config.images.clone(),
             tools,

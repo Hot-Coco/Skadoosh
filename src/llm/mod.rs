@@ -1,7 +1,8 @@
 //! Streaming LLM client (OpenAI-compatible SSE), the pluggable
-//! [`LlmBackend`] trait, and clause splitting.
+//! [`LlmBackend`] trait, model registry, and clause splitting.
 
 pub mod client;
+pub mod model;
 pub mod splitter;
 
 use std::future::Future;

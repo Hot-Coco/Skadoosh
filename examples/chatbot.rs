@@ -9,7 +9,10 @@
 //!    ```sh
 //!    curl -fsSL https://ollama.com/install.sh | sh
 //!    ollama serve            # listens on http://localhost:11434
-//!    ollama pull llama3.2    # download the default model
+//!    # download + register the default model (one-time):
+//!    wget https://huggingface.co/StealthyML/StealthyLM-Emotive/resolve/main/StealthyLM_Q4KM.gguf
+//!    echo 'FROM ./StealthyLM_Q4KM.gguf' > Modelfile
+//!    ollama create stealthylm -f Modelfile
 //!    ```
 //!
 //! 2. Build and run the chatbot:
@@ -26,7 +29,7 @@
 //! | Variable            | Default                     | Meaning                          |
 //! |---------------------|-----------------------------|----------------------------------|
 //! | `SKADOOSH_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible LLM base URL   |
-//! | `SKADOOSH_MODEL`    | `llama3.2`                  | Model name for chat completions  |
+//! | `SKADOOSH_MODEL`    | `stealthylm`                | Model name for chat completions  |
 //! | `SKADOOSH_API_KEY`  | `ollama`                    | Bearer token (Ollama needs none) |
 //!
 //! Any hosted OpenAI-compatible provider works too — set the base URL, model,
@@ -56,7 +59,7 @@ use skadoosh::{Agent, Config, OutputMode, Result, SkadooshError};
 /// OpenAI-compatible base URL (env `SKADOOSH_BASE_URL`).
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 /// Model name (env `SKADOOSH_MODEL`).
-const DEFAULT_MODEL: &str = "llama3.2";
+const DEFAULT_MODEL: &str = "stealthylm";
 /// Bearer token / API key (env `SKADOOSH_API_KEY`).
 const DEFAULT_API_KEY: &str = "ollama";
 

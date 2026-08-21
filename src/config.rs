@@ -55,7 +55,7 @@ pub struct Config {
     pub llm_url: String,
 
     /// Model name passed to the chat-completions API.
-    #[arg(long, env = "SKADOOSH_LLM_MODEL", default_value = "qwen2.5:0.5b")]
+    #[arg(long, env = "SKADOOSH_LLM_MODEL", default_value = "stealthylm")]
     pub llm_model: String,
 
     /// API key for hosted OpenAI-compatible providers; sent as
@@ -318,7 +318,7 @@ impl Default for Config {
         Self {
             images: Vec::new(),
             llm_url: "http://localhost:11434/v1".to_string(),
-            llm_model: "qwen2.5:0.5b".to_string(),
+            llm_model: "stealthylm".to_string(),
             api_key: None,
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             max_history_turns: 8,

@@ -15,7 +15,10 @@
 //! 1. Run a local OpenAI-compatible LLM server (Ollama is the default
 //!    endpoint) and pull a model:
 //!    ```sh
-//!    ollama pull llama3.2
+//!    # download + register the default model (one-time):
+//!    wget https://huggingface.co/StealthyML/StealthyLM-Emotive/resolve/main/StealthyLM_Q4KM.gguf
+//!    echo 'FROM ./StealthyLM_Q4KM.gguf' > Modelfile
+//!    ollama create stealthylm -f Modelfile
 //!    ollama serve            # listens on http://localhost:11434
 //!    ```
 //! 2. Fetch the embedding model used to index the documents:
@@ -44,7 +47,7 @@
 //!   index (walked recursively).
 //! * `SKADOOSH_BASE_URL` *(optional, default `http://localhost:11434/v1`)* —
 //!   the OpenAI-compatible LLM endpoint.
-//! * `SKADOOSH_MODEL` *(optional, default `llama3.2`)* — model name requested
+//! * `SKADOOSH_MODEL` *(optional, default `stealthylm`)* — model name requested
 //!   from the endpoint.
 //! * `SKADOOSH_RAG_MODEL` *(optional, default
 //!   `models/all-MiniLM-L6-v2.onnx`)* — path to the embedding ONNX model.
@@ -254,7 +257,7 @@ fn main() -> Result<()> {
     })?;
     let base_url = std::env::var("SKADOOSH_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-    let model = std::env::var("SKADOOSH_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
+    let model = std::env::var("SKADOOSH_MODEL").unwrap_or_else(|_| "stealthylm".to_string());
     let api_key = std::env::var("SKADOOSH_API_KEY").ok();
     let rag_model =
         std::env::var("SKADOOSH_RAG_MODEL").unwrap_or_else(|_| DEFAULT_RAG_MODEL.to_string());

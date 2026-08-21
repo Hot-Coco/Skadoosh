@@ -6,7 +6,7 @@
 //!   `scripts/download_models.sh`),
 //! * a microphone + speaker (or the ALSA null devices for a smoke run),
 //! * an OpenAI-compatible LLM server — local Ollama by default:
-//!   `ollama pull qwen2.5:0.5b && ollama serve`.
+//!   `ollama create stealthylm -f Modelfile && ollama serve`.
 //!
 //! With no Kokoro TTS model configured, the agent speaks in the MockTts
 //! sine wave (the pitch of pure triumph).

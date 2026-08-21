@@ -30,8 +30,19 @@ That's a full voice agent. See `examples/` for text mode, mock engines, and cust
 
 ## Quickstart (binary)
 
+First install the default model — [StealthyLM-Emotive](https://huggingface.co/StealthyML/StealthyLM-Emotive),
+a Qwen2.5-1.5B voice-optimised GGUF fine-tuned for Skadoosh:
+
 ```bash
-ollama pull qwen2.5:0.5b && ollama serve
+wget https://huggingface.co/StealthyML/StealthyLM-Emotive/resolve/main/StealthyLM_Q4KM.gguf
+echo 'FROM ./StealthyLM_Q4KM.gguf' > Modelfile
+ollama create stealthylm -f Modelfile
+```
+
+Then start the agent:
+
+```bash
+ollama serve
 ./scripts/download_models.sh           # VAD + Whisper (~76 MB)
 ./scripts/download_models.sh --with-kokoro  # + Kokoro TTS (~320 MB, needs espeak-ng)
 skadoosh
@@ -64,7 +75,7 @@ Every flag has a `SKADOOSH_` env var. `--api-key` is never logged.
 | Flag | Default | What it does |
 |---|---|---|
 | `--llm-url` | `http://localhost:11434/v1` | OpenAI-compatible base URL |
-| `--llm-model` | `qwen2.5:0.5b` | Model name |
+| `--llm-model` | `stealthylm` | Model name |
 | `--api-key` | — | Bearer token for hosted providers |
 | `--whisper-model` | `models/ggml-tiny.en.bin` | STT model |
 | `--tts-model` | — | Kokoro ONNX (absent → sine mock) |

@@ -46,7 +46,11 @@ This needs no models and no audio device — just an LLM server. Start Ollama,
 pull the default model, and run the text REPL:
 
 ```bash
-ollama pull qwen2.5:0.5b
+# Download and register the model (one-time)
+wget https://huggingface.co/StealthyML/StealthyLM-Emotive/resolve/main/StealthyLM_Q4KM.gguf
+echo 'FROM ./StealthyLM_Q4KM.gguf' > Modelfile
+ollama create stealthylm -f Modelfile
+
 ollama serve
 skadoosh --repl
 ```
@@ -105,7 +109,7 @@ env vars win over defaults. The core ones:
 | Env var | Flag | Default | Purpose |
 |---|---|---|---|
 | `SKADOOSH_LLM_URL` | `--llm-url` | `http://localhost:11434/v1` | OpenAI-compatible base URL |
-| `SKADOOSH_LLM_MODEL` | `--llm-model` | `qwen2.5:0.5b` | Model name |
+| `SKADOOSH_LLM_MODEL` | `--llm-model` | `stealthylm` | Model name |
 | `SKADOOSH_API_KEY` | `--api-key` | — | Bearer token for hosted providers (never logged; Ollama needs none) |
 
 Point at a hosted provider instead of Ollama:
@@ -140,7 +144,7 @@ files only warn — the agent falls back to MockTts; add them with
 
 **Ollama not running.** A connection refused to `localhost:11434` means the
 server isn't up. Start it with `ollama serve`, confirm the model is pulled
-(`ollama list`, else `ollama pull qwen2.5:0.5b`), or point elsewhere with
+(`ollama list`, else create it with `ollama create stealthylm -f Modelfile`), or point elsewhere with
 `SKADOOSH_LLM_URL=...`.
 
 **Build fails on missing audio libs.** The default `audio` feature links
