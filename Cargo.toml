@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.8.4"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -171,9 +171,18 @@ path = "cookbooks/15_push_to_talk.rs"
 # playback) needs the `audio` feature's system libraries, so they are skipped
 # in a no-`audio` (text-only / docs) build.
 [[example]]
+name = "chatbot"
+
+[[example]]
 name = "mock_agent"
 required-features = ["audio"]
 
 [[example]]
 name = "voice_agent"
 required-features = ["audio"]
+
+# Text-only RAG demo: loads .txt/.md docs, indexes them with `rag::RagStore`,
+# and answers one query by retrieving and injecting the top-k chunks. Needs no
+# `audio` feature (it does link the ONNX embedder via `ort`, like any RAG use).
+[[example]]
+name = "docbot"
