@@ -2,6 +2,7 @@
 //! sine-wave mock fallback).
 
 pub mod emotion;
+#[cfg(feature = "audio")]
 pub mod misaki_g2p;
 pub mod mock;
 pub mod onnx;

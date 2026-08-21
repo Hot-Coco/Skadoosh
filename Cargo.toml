@@ -1,6 +1,6 @@
 [package]
 name = "skadoosh"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 rust-version = "1.88"
 description = "Modular, low-latency local voice agent framework: VAD → Whisper STT → streaming LLM → ONNX TTS with barge-in"
@@ -35,7 +35,7 @@ load-dynamic = ["ort/load-dynamic"]
 ## libclang-dev): the SDK traits, `Agent` text/REPL/`say_to_wav` paths, and the
 ## mock engines stay available — only mic capture, playback, VAD, whisper STT,
 ## echo cancellation, and the pipeline orchestrator are gated out.
-audio = ["dep:cpal", "dep:whisper-rs", "dep:aec-rs"]
+audio = ["dep:cpal", "dep:whisper-rs", "dep:aec-rs", "dep:misaki-rs"]
 ## GPU execution-provider feature flags. Enable exactly one for your platform.
 ## None enabled by default — ONNX Runtime falls back to CPU.
 ## * `gpu-cuda` — NVIDIA CUDA (requires CUDA toolkit at build time).
@@ -65,7 +65,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "=4", features = ["derive", "env"] }
 base64 = "=0.22"
 aec-rs = { version = "=1", optional = true }
-misaki-rs = "0.3"
+misaki-rs = { version = "0.3", optional = true }
 crossterm = "=0.28"
 # WASM skill/plugin sandbox (`--plugins-dir`). Default features are disabled to
 # keep the dependency footprint small: the plugin system only needs the Cranelift

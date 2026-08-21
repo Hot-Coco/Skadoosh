@@ -19,7 +19,7 @@ const ESPEAK_BIN: &str = "espeak-ng";
 /// because `espeak-ng --ipa` drops all punctuation from its output.
 const TERMINAL_PUNCT: &[char] = &['.', '!', '?', ',', ';', ':'];
 
-/// Phonemizes English text. Uses the pure-Rust [`misaki_rs`] G2P engine
+/// Phonemizes English text. Uses the pure-Rust `misaki_rs` G2P engine
 /// when available; falls back to `espeak-ng` if misaki fails to load.
 /// Terminal punctuation (`. ! ? , ; :`) that phonemizers strip from the
 /// output is re-appended afterwards so Kokoro still sees clause-final
@@ -27,6 +27,7 @@ const TERMINAL_PUNCT: &[char] = &['.', '!', '?', ',', ';', ':'];
 /// See [`phonemize_with`] for direct espeak control.
 pub fn phonemize(text: &str) -> Result<String> {
     // Try misaki first — pure Rust, no external binary.
+    #[cfg(feature = "audio")]
     let (ipa, from_misaki) = match super::misaki_g2p::PHONEMIZER.phonemize(text) {
         Ok(ipa) if !ipa.is_empty() || text.trim().is_empty() => (ipa, true),
         Ok(ipa) => (ipa, true),
@@ -35,6 +36,8 @@ pub fn phonemize(text: &str) -> Result<String> {
             (phonemize_with(Path::new(ESPEAK_BIN), text)?, false)
         }
     };
+    #[cfg(not(feature = "audio"))]
+    let (ipa, from_misaki) = (phonemize_with(Path::new(ESPEAK_BIN), text)?, false);
     // Re-append terminal punctuation that phonemizers drop. misaki may
     // preserve some punctuation, espeak always strips it in IPA mode.
     let mut result = if from_misaki {
