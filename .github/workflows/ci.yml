@@ -41,8 +41,7 @@ jobs:
             ~/.cargo/git
             target
             models
-          key: ${{ runner.os }}-skadoosh-v2-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-skadoosh-
+          key: ${{ runner.os }}-skadoosh-v3-${{ hashFiles('Cargo.lock') }}
 
       - name: Download models and fixtures
         run: ./scripts/download_models.sh
