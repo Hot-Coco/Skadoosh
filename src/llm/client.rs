@@ -886,7 +886,8 @@ impl LlmClient {
                 || self.forward_tool.is_some()
                 || self.mesh.is_some()
                 || self.sandbox_tool.is_some()
-                || self.plugin_manager.is_some();
+                || self.plugin_manager.is_some()
+                || !self.tools.is_empty(); // built-in tools always registered
             if has_executor {
                 // Collect configured tool names for validation — rejects
                 // tool calls the model hallucinates that weren't defined.
